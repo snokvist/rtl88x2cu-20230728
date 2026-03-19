@@ -4341,64 +4341,6 @@ int recv_func(_adapter *padapter, union recv_frame *rframe)
 	u8 type;
 #endif
 
-	/*
-	 * Cooperative RX monitor mode hook: when the helper is in
-	 * monitor mode, intercept data frames here (before they go
-	 * to recv_frame_monitor which just delivers to the monitor
-	 * socket) and forward them to the primary's reorder window.
-	 */
-	if (check_fwstate(mlmepriv, WIFI_MONITOR_STATE)
-	    && unlikely(rtw_coop_rx_is_helper(padapter))) {
-		u8 frame_type = GetFrameType(ptr);
-
-		if (frame_type == WIFI_DATA_TYPE) {
-			struct rx_pkt_attrib *pattrib = &rframe->u.hdr.attrib;
-			u8 to_fr_ds = get_tofr_ds(ptr);
-
-			pattrib->to_fr_ds = to_fr_ds;
-			pattrib->seq_num = GetSequence(ptr);
-			pattrib->frag_num = GetFragNum(ptr);
-			pattrib->privacy = GetPrivacy(ptr);
-
-			switch (to_fr_ds) {
-			case 2: /* From DS=1, To DS=0: AP->STA */
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid, get_addr2_ptr(ptr), ETH_ALEN);
-				break;
-			case 1: /* From DS=0, To DS=1: STA->AP */
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid, GetAddr1Ptr(ptr), ETH_ALEN);
-				break;
-			default:
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(ptr), ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid, GetAddr3Ptr(ptr), ETH_ALEN);
-				break;
-			}
-
-			if ((get_frame_sub_type(ptr) & WIFI_QOS_DATA_TYPE)
-			    == WIFI_QOS_DATA_TYPE) {
-				u8 a4_shift = (to_fr_ds == 3) ? ETH_ALEN : 0;
-				pattrib->qos = 1;
-				pattrib->priority = GetPriority(
-					(ptr + WLAN_HDR_A3_LEN + a4_shift));
-			} else {
-				pattrib->qos = 0;
-				pattrib->priority = 0;
-			}
-
-			ret = rtw_coop_rx_submit_helper_frame(rframe, padapter);
-			if (ret == RTW_RX_HANDLED) {
-				ret = _SUCCESS;
-				goto exit;
-			}
-			/* Merge rejected — let monitor path handle it */
-		}
-		/* Non-data frames fall through to normal monitor path */
-	}
-
 	if (check_fwstate(mlmepriv, WIFI_MONITOR_STATE)
 #ifdef RTW_SIMPLE_CONFIG
 		|| (check_fwstate(mlmepriv, WIFI_AP_STATE) && padapter->rtw_simple_config == _TRUE && IS_MCAST(get_ra(ptr)))

@@ -46,6 +46,7 @@ struct coop_rx_stats {
 	atomic_t helper_rx_candidates;	/* frames considered from helper */
 	atomic_t helper_rx_accepted;	/* frames injected into primary */
 	atomic_t helper_rx_dup_dropped;	/* duplicates caught at merge */
+	atomic_t helper_rx_pool_full;	/* primary recv_frame pool exhausted */
 	atomic_t helper_rx_foreign;	/* wrong BSSID/TA, rejected */
 	atomic_t helper_rx_crypto_err;	/* decryption failures */
 	atomic_t helper_rx_late;	/* too late for reorder window */
@@ -84,8 +85,7 @@ struct cooperative_rx_group {
 	int num_helpers;
 
 	/* Session binding — which BSS we're filtering for */
-	u8 bound_bssid[ETH_ALEN];
-	u8 bound_ap_mac[ETH_ALEN];	/* TA of the AP */
+	u8 bound_bssid[ETH_ALEN];	/* BSSID = AP MAC (TA) in infra BSS */
 	u8 bound_channel;
 	u8 bound_bw;
 
@@ -161,5 +161,11 @@ void rtw_coop_rx_sysfs_deinit(struct net_device *ndev);
 /* debugfs */
 int rtw_coop_rx_debugfs_init(void);
 void rtw_coop_rx_debugfs_deinit(void);
+
+/* Exported from os_intfs.c for driver-owned net_device validation */
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
+extern const struct net_device_ops rtw_netdev_ops;
+#endif
 
 #endif /* __RTW_COOPERATIVE_RX_H__ */

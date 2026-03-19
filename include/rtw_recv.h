@@ -961,6 +961,7 @@ void count_rx_stats(_adapter *padapter, union recv_frame *prframe, struct sta_in
 
 /* Exposed for cooperative RX merge path */
 int recv_indicatepkt_reorder(_adapter *padapter, union recv_frame *prframe);
+int recv_func_posthandle(_adapter *padapter, union recv_frame *prframe);
 int recv_process_mpdu(_adapter *padapter, union recv_frame *prframe);
 
 #endif

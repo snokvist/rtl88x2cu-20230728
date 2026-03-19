@@ -34,6 +34,7 @@
 /* Module parameter — 0=disabled (default), 1=enabled */
 int rtw_cooperative_rx = 0;
 
+
 /* Global cooperative group singleton */
 struct cooperative_rx_group *rtw_coop_rx_group = NULL;
 
@@ -94,10 +95,10 @@ void rtw_coop_rx_deinit(void)
 	grp->num_helpers = 0;
 	spin_unlock_irqrestore(&grp->lock, flags);
 
-	/* Ensure no readers are in the hot path */
+	/* NULL the pointer first, then wait for readers, then free */
+	WRITE_ONCE(rtw_coop_rx_group, NULL);
 	synchronize_rcu();
 
-	WRITE_ONCE(rtw_coop_rx_group, NULL);
 	rtw_mfree((u8 *)grp, sizeof(*grp));
 
 	RTW_INFO("%s: cooperative RX group destroyed\n", __func__);
@@ -268,7 +269,6 @@ void rtw_coop_rx_remove_adapter(_adapter *adapter)
 	if (grp->primary == adapter) {
 		RTW_INFO("%s: primary adapter removed, tearing down "
 			 "cooperative group\n", __func__);
-		grp->state = COOP_STATE_TEARDOWN;
 		grp->primary = NULL;
 		grp->primary_dvobj = NULL;
 		grp->num_helpers = 0;
@@ -310,10 +310,8 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 
 	spin_lock_irqsave(&grp->lock, flags);
 
-	/* Capture BSS context */
+	/* Capture BSS context (BSSID = AP MAC in infra BSS) */
 	_rtw_memcpy(grp->bound_bssid,
-		     cur_network->network.MacAddress, ETH_ALEN);
-	_rtw_memcpy(grp->bound_ap_mac,
 		     cur_network->network.MacAddress, ETH_ALEN);
 	grp->bound_channel = primary->mlmeextpriv.cur_channel;
 	grp->bound_bw = primary->mlmeextpriv.cur_bwmode;
@@ -324,20 +322,25 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 	if (grp->num_helpers > 0)
 		grp->state = COOP_STATE_ACTIVE;
 
-	/* Enable monitor mode on all helpers and park on bound channel.
-	 * Must drop spinlock before calling rtw_setopmode_cmd (sleeps). */
-	for (i = 0; i < grp->num_helpers; i++) {
-		if (grp->helpers[i]) {
-			_adapter *helper = grp->helpers[i];
-			u8 ch = grp->bound_channel;
+	/* Snapshot helpers under lock, then release before calling
+	 * rtw_setopmode_cmd (which sleeps). After release, the live
+	 * helpers[] array may change, but our snapshot is safe. */
+	{
+		_adapter *helper_snap[COOP_MAX_HELPERS];
+		int snap_count = grp->num_helpers;
+		u8 ch = grp->bound_channel;
 
-			spin_unlock_irqrestore(&grp->lock, flags);
-			rtw_coop_rx_enable_helper_monitor(helper, ch);
-			spin_lock_irqsave(&grp->lock, flags);
+		for (i = 0; i < snap_count; i++)
+			helper_snap[i] = grp->helpers[i];
+
+		spin_unlock_irqrestore(&grp->lock, flags);
+
+		for (i = 0; i < snap_count; i++) {
+			if (helper_snap[i])
+				rtw_coop_rx_enable_helper_monitor(
+					helper_snap[i], ch);
 		}
 	}
-
-	spin_unlock_irqrestore(&grp->lock, flags);
 
 	RTW_INFO("%s: session bound to BSSID="MAC_FMT" ch=%u bw=%u "
 		 "(helpers=%d, state=%s)\n",
@@ -357,6 +360,7 @@ int rtw_coop_rx_bind_session(_adapter *primary)
  */
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 {
+	struct cooperative_rx_group *grp = READ_ONCE(rtw_coop_rx_group);
 	struct net_device *ndev = helper->pnetdev;
 
 	/* Set netdev type for radiotap headers */
@@ -388,31 +392,46 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter)
 {
 	struct cooperative_rx_group *grp;
-	u8 new_ch;
+	_adapter *helper_snap[COOP_MAX_HELPERS];
+	int snap_count;
+	unsigned long flags;
+	u8 new_ch, old_ch;
 	int i;
 
 	if (!rtw_coop_rx_enabled())
 		return;
 
 	grp = READ_ONCE(rtw_coop_rx_group);
-	if (!grp || grp->state != COOP_STATE_ACTIVE)
+	if (!grp)
 		return;
 
-	if (grp->primary != adapter)
+	spin_lock_irqsave(&grp->lock, flags);
+
+	if (grp->state != COOP_STATE_ACTIVE || grp->primary != adapter) {
+		spin_unlock_irqrestore(&grp->lock, flags);
 		return;
+	}
 
 	new_ch = adapter->mlmeextpriv.cur_channel;
-	if (new_ch == 0 || new_ch == grp->bound_channel)
+	old_ch = grp->bound_channel;
+	if (new_ch == 0 || new_ch == old_ch) {
+		spin_unlock_irqrestore(&grp->lock, flags);
 		return;
-
-	RTW_INFO("%s: primary channel changed %u -> %u, moving helpers\n",
-		 __func__, grp->bound_channel, new_ch);
+	}
 
 	grp->bound_channel = new_ch;
+	snap_count = grp->num_helpers;
+	for (i = 0; i < snap_count; i++)
+		helper_snap[i] = grp->helpers[i];
 
-	for (i = 0; i < grp->num_helpers; i++) {
-		if (grp->helpers[i])
-			set_channel_bwmode(grp->helpers[i], new_ch,
+	spin_unlock_irqrestore(&grp->lock, flags);
+
+	RTW_INFO("%s: primary channel changed %u -> %u, moving helpers\n",
+		 __func__, old_ch, new_ch);
+
+	for (i = 0; i < snap_count; i++) {
+		if (helper_snap[i])
+			set_channel_bwmode(helper_snap[i], new_ch,
 					   HAL_PRIME_CHNL_OFFSET_DONT_CARE,
 					   CHANNEL_WIDTH_20);
 	}
@@ -432,7 +451,6 @@ void rtw_coop_rx_unbind_session(void)
 	    grp->state == COOP_STATE_BINDING) {
 		grp->state = grp->primary ? COOP_STATE_IDLE : COOP_STATE_DISABLED;
 		memset(grp->bound_bssid, 0, ETH_ALEN);
-		memset(grp->bound_ap_mac, 0, ETH_ALEN);
 		grp->bound_channel = 0;
 		RTW_INFO("%s: session unbound\n", __func__);
 	}
@@ -519,8 +537,8 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		return _FAIL;
 	}
 
-	/* Validate: TA must match bound AP */
-	if (_rtw_memcmp(pattrib->ta, grp->bound_ap_mac, ETH_ALEN) == _FALSE) {
+	/* Validate: TA must match bound AP (BSSID = AP MAC in infra BSS) */
+	if (_rtw_memcmp(pattrib->ta, grp->bound_bssid, ETH_ALEN) == _FALSE) {
 		atomic_inc(&grp->stats.helper_rx_foreign);
 		rcu_read_unlock();
 		return _FAIL;
@@ -555,6 +573,45 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	}
 
 	/*
+	 * Fix up encryption fields for monitor-mode helper frames.
+	 *
+	 * In monitor mode the RX descriptor reports encrypt=0 even for
+	 * encrypted frames (HW CAM lookup is bypassed). Detect encryption
+	 * from the 802.11 Protected Frame bit (pattrib->privacy) and
+	 * populate encrypt/iv_len/icv_len from the primary's security
+	 * context. This allows the decryptor in recv_func_posthandle()
+	 * to SW-decrypt the frame using the primary's keys.
+	 */
+	if (pattrib->privacy && pattrib->encrypt == 0) {
+		struct security_priv *psec = &primary->securitypriv;
+		u8 a4_shift = (pattrib->to_fr_ds == 3) ? ETH_ALEN : 0;
+
+		GET_ENCRY_ALGO(psec, psta, pattrib->encrypt,
+			       IS_MCAST(pattrib->ra));
+		SET_ICE_IV_LEN(pattrib->iv_len, pattrib->icv_len,
+			       pattrib->encrypt);
+		pattrib->bdecrypted = 0;
+		pattrib->hdrlen = pattrib->qos ?
+			(WLAN_HDR_A3_QOS_LEN + a4_shift) :
+			(WLAN_HDR_A3_LEN + a4_shift);
+
+		if (pattrib->encrypt == _NO_PRIVACY_) {
+			/* Primary has no keys — can't decrypt */
+			atomic_inc(&grp->stats.helper_rx_crypto_err);
+			rcu_read_unlock();
+			return _FAIL;
+		}
+	}
+
+	/* Still-encrypted frames that HW should have decrypted but didn't */
+	if (pattrib->encrypt && !pattrib->bdecrypted &&
+	    !pattrib->privacy) {
+		atomic_inc(&grp->stats.helper_rx_crypto_err);
+		rcu_read_unlock();
+		return _FAIL;
+	}
+
+	/*
 	 * Run remaining validation checks BEFORE allocating a primary
 	 * recv_frame, so that on _FAIL the caller still owns its frame.
 	 */
@@ -576,16 +633,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 				return _FAIL;
 			}
 		}
-
-		if (pattrib->encrypt && !pattrib->bdecrypted) {
-			struct security_priv *psec = &primary->securitypriv;
-
-			if (psec->dot11PrivacyAlgrthm != _NO_PRIVACY_) {
-				atomic_inc(&grp->stats.helper_rx_crypto_err);
-				rcu_read_unlock();
-				return _FAIL;
-			}
-		}
 	} else {
 		unsigned long flags;
 		bool is_dup;
@@ -596,12 +643,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 
 		if (is_dup) {
 			atomic_inc(&grp->stats.helper_rx_dup_dropped);
-			rcu_read_unlock();
-			return _FAIL;
-		}
-
-		if (pattrib->encrypt && !pattrib->bdecrypted) {
-			atomic_inc(&grp->stats.helper_rx_crypto_err);
 			rcu_read_unlock();
 			return _FAIL;
 		}
@@ -617,7 +658,7 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	precvpriv_primary = &primary->recvpriv;
 	pframe_primary = rtw_alloc_recvframe(&precvpriv_primary->free_recv_queue);
 	if (!pframe_primary) {
-		atomic_inc(&grp->stats.helper_rx_dup_dropped);
+		atomic_inc(&grp->stats.helper_rx_pool_full);
 		rcu_read_unlock();
 		return _FAIL;
 	}
@@ -649,27 +690,17 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			   &helper_adapter->recvpriv.free_recv_queue);
 
 	/*
-	 * Submit the primary frame to the appropriate processing path.
-	 * From here on, the primary frame is owned by the reorder engine
-	 * or the stack — we must not touch it after submission.
+	 * Submit the primary frame through recv_func_posthandle(), which
+	 * runs: decryptor → defrag → portctrl → reorder.
+	 * This handles SW decryption of encrypted helper frames, as well
+	 * as natural duplicate suppression in the reorder window.
 	 */
-	if (pframe_primary->u.hdr.attrib.qos) {
-		u8 tid = pframe_primary->u.hdr.attrib.priority;
-
-		pframe_primary->u.hdr.preorder_ctrl =
-			&psta->recvreorder_ctrl[tid];
-
-		ret = recv_indicatepkt_reorder(primary, pframe_primary);
-		if (ret == RTW_RX_HANDLED || ret == _SUCCESS) {
-			atomic_inc(&grp->stats.helper_rx_accepted);
-			ret = RTW_RX_HANDLED;
-		} else {
-			atomic_inc(&grp->stats.helper_rx_dup_dropped);
-		}
-	} else {
-		recv_process_mpdu(primary, pframe_primary);
+	ret = recv_func_posthandle(primary, pframe_primary);
+	if (ret == _SUCCESS || ret == RTW_RX_HANDLED) {
 		atomic_inc(&grp->stats.helper_rx_accepted);
 		ret = RTW_RX_HANDLED;
+	} else {
+		atomic_inc(&grp->stats.helper_rx_dup_dropped);
 	}
 
 	rcu_read_unlock();
@@ -751,6 +782,7 @@ static ssize_t coop_rx_show_stats(struct device *dev,
 		"helper_rx_candidates: %d\n"
 		"helper_rx_accepted: %d\n"
 		"helper_rx_dup_dropped: %d\n"
+		"helper_rx_pool_full: %d\n"
 		"helper_rx_foreign: %d\n"
 		"helper_rx_crypto_err: %d\n"
 		"helper_rx_late: %d\n"
@@ -765,6 +797,7 @@ static ssize_t coop_rx_show_stats(struct device *dev,
 		atomic_read(&grp->stats.helper_rx_candidates),
 		atomic_read(&grp->stats.helper_rx_accepted),
 		atomic_read(&grp->stats.helper_rx_dup_dropped),
+		atomic_read(&grp->stats.helper_rx_pool_full),
 		atomic_read(&grp->stats.helper_rx_foreign),
 		atomic_read(&grp->stats.helper_rx_crypto_err),
 		atomic_read(&grp->stats.helper_rx_late),
@@ -802,6 +835,13 @@ static ssize_t coop_rx_store_pair(struct device *dev,
 		return -ENODEV;
 	}
 
+	/* Verify the interface belongs to this driver */
+	if (helper_ndev->netdev_ops != &rtw_netdev_ops) {
+		RTW_WARN("coop_rx: '%s' is not an RTW interface\n", ifname);
+		dev_put(helper_ndev);
+		return -EINVAL;
+	}
+
 	helper_adapter = rtw_netdev_priv(helper_ndev);
 	if (!helper_adapter) {
 		dev_put(helper_ndev);
@@ -832,6 +872,12 @@ static ssize_t coop_rx_store_unpair(struct device *dev,
 	helper_ndev = dev_get_by_name(&init_net, ifname);
 	if (!helper_ndev)
 		return -ENODEV;
+
+	/* Verify the interface belongs to this driver */
+	if (helper_ndev->netdev_ops != &rtw_netdev_ops) {
+		dev_put(helper_ndev);
+		return -EINVAL;
+	}
 
 	helper_adapter = rtw_netdev_priv(helper_ndev);
 	ret = rtw_coop_rx_remove_helper(helper_adapter);
@@ -939,6 +985,8 @@ static int coop_debugfs_stats_show(struct seq_file *s, void *data)
 		   atomic_read(&grp->stats.helper_rx_accepted));
 	seq_printf(s, "helper_rx_dup_dropped: %d\n",
 		   atomic_read(&grp->stats.helper_rx_dup_dropped));
+	seq_printf(s, "helper_rx_pool_full:   %d\n",
+		   atomic_read(&grp->stats.helper_rx_pool_full));
 	seq_printf(s, "helper_rx_foreign:     %d\n",
 		   atomic_read(&grp->stats.helper_rx_foreign));
 	seq_printf(s, "helper_rx_crypto_err:  %d\n",

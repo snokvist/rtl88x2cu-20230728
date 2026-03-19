@@ -1823,7 +1823,7 @@ static int rtw_siocdevprivate(struct net_device *dev, struct ifreq *ifr,
 #endif
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
-static const struct net_device_ops rtw_netdev_ops = {
+const struct net_device_ops rtw_netdev_ops = {
 	.ndo_init = rtw_ndev_init,
 	.ndo_uninit = rtw_ndev_uninit,
 	.ndo_open = netdev_open,

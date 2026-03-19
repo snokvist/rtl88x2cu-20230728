@@ -1,11 +1,11 @@
 # Cooperative RX Diversity Mode — Design Document
-## RTL8821CU Vendor Driver (8821cu-20210916)
+## RTL8822CU Vendor Driver (rtl88x2cu-20230728)
 
 ### Executive Feasibility Summary
 
 **Verdict: FEASIBLE with careful implementation.**
 
-The RTL8821CU vendor driver uses a cfg80211 + custom vendor MLME stack (NOT
+The RTL8822CU vendor driver uses a cfg80211 + custom vendor MLME stack (NOT
 mac80211). The RX path is entirely in-driver, giving us full control over
 frame processing order. Two separate identical USB adapters each have their
 own `dvobj_priv` and `_adapter` structures, but can be linked via a new
@@ -155,24 +155,24 @@ already decrypted and can skip SW decryption on the primary path.
 
 #### 2.2 Merge Point Selection
 
-**Selected merge point:** Inside the primary adapter's
-`recv_indicatepkt_reorder()`, or equivalently, after
-`recv_func_posthandle()` processing but feeding into the reorder path.
+**Selected merge point:** `recv_func_posthandle()` on the primary adapter.
+This runs the full decrypt → defrag → portctrl → reorder pipeline.
 
 For the helper frame, we:
-1. Parse the RX descriptor and extract metadata (done in helper's
-   `recvbuf2recvframe()`)
-2. Validate the frame belongs to the primary's active session (BSSID, TA match)
-3. Perform decryption if needed (helper can use HW decrypt with same keys)
-4. Feed directly into primary's `recv_indicatepkt_reorder()` or
-   `recv_process_mpdu()` depending on whether it's AMPDU
+1. Parse the 802.11 header in `pre_recv_entry()` (BSSID, TA, RA, seq, TID)
+2. Validate the frame belongs to the primary's active session
+3. Fix up encryption fields from the primary's `security_priv` (monitor mode
+   RX descriptor reports `encrypt=0` even for encrypted frames)
+4. Allocate a recv_frame from the primary's pool, transfer the skb
+5. Submit to `recv_func_posthandle()` which SW-decrypts using the primary's
+   pairwise key, then feeds into the reorder window
 
 **Why this point:**
-- Before reorder: helper frames fill gaps in primary's reorder window
-- After decrypt: frame content is usable
-- Reorder window provides natural dedup: same seq_num → same slot → no
-  double delivery
-- For non-QoS/non-AMPDU traffic: explicit seq_num check before delivery
+- SW decryption works on encrypted networks (WPA2/WPA3) without HW CAM
+- CCMP PN replay check provides natural dedup for in-window duplicates
+- Reorder window catches out-of-window duplicates by sequence number
+- For non-QoS/non-AMPDU traffic: explicit seq_num cache before submission
+- HW decryption is not possible in monitor mode (RCR bypasses CAM lookup)
 
 #### 2.3 Cooperative Context Structure
 
@@ -180,30 +180,39 @@ For the helper frame, we:
 /* Global cooperative RX group - spans across dvobj boundaries */
 struct cooperative_rx_group {
     spinlock_t lock;
+    enum coop_rx_state state;
 
     /* Primary adapter reference */
     _adapter *primary;
     struct dvobj_priv *primary_dvobj;
 
     /* Helper adapter(s) - extensible to N helpers */
-    _adapter *helpers[COOP_MAX_HELPERS];  /* initially 1 */
+    _adapter *helpers[COOP_MAX_HELPERS];
     struct dvobj_priv *helper_dvobjs[COOP_MAX_HELPERS];
     int num_helpers;
 
     /* Session binding */
-    u8 bound_bssid[ETH_ALEN];   /* BSSID we're filtering for */
+    u8 bound_bssid[ETH_ALEN];   /* BSSID = AP MAC (TA) in infra BSS */
     u8 bound_channel;
     u8 bound_bw;
-    bool active;                 /* feature is live */
 
-    /* Statistics */
-    atomic_t helper_rx_candidates;   /* frames considered */
-    atomic_t helper_rx_accepted;     /* frames injected */
-    atomic_t helper_rx_dup_dropped;  /* duplicates caught */
-    atomic_t helper_rx_foreign;      /* wrong BSSID/TA */
-    atomic_t helper_rx_crypto_err;   /* decrypt failures */
-    atomic_t helper_rx_late;         /* too late for reorder */
-    atomic_t fallback_events;        /* helper disappeared */
+    /* Non-QoS dedup cache */
+    struct coop_nonqos_seq_cache nonqos_cache;
+
+    /* Statistics (nested struct, all atomic) */
+    struct coop_rx_stats {
+        atomic_t helper_rx_candidates;   /* frames considered */
+        atomic_t helper_rx_accepted;     /* frames injected */
+        atomic_t helper_rx_dup_dropped;  /* duplicates caught */
+        atomic_t helper_rx_pool_full;    /* primary pool exhausted */
+        atomic_t helper_rx_foreign;      /* wrong BSSID/TA */
+        atomic_t helper_rx_crypto_err;   /* decrypt failures */
+        atomic_t helper_rx_late;         /* too late for reorder */
+        atomic_t helper_rx_no_sta;       /* sta_info not found */
+        atomic_t fallback_events;        /* helper disappeared */
+        atomic_t pair_events;            /* successful pairings */
+        atomic_t unpair_events;          /* teardown events */
+    } stats;
 };
 ```
 
@@ -277,7 +286,6 @@ For non-QoS frames that don't go through the reorder window:
 - No multi-channel operation
 - No cross-BSSID roaming assistance
 - No helper TX capability
-- No monitor mode while cooperative active
 - No automatic adapter discovery (manual pairing via sysfs/debugfs)
 
 #### 3.3 Kill Switches
@@ -369,3 +377,19 @@ With helper paired and active:
 - Remove helper USB adapter → automatic fallback
 - Revert patch series → all changes in isolated files + minimal hooks
 - Each patch independently revertible in reverse order
+
+### 8. Porting Guide
+
+Driver-specific touchpoints that must be adapted when porting cooperative
+RX to a different Realtek vendor driver (e.g. rtl8821cu, rtl8812au):
+
+| Touchpoint | File | Notes |
+|---|---|---|
+| RX descriptor parsing | `hal/<chip>/rtl<chip>_rxdesc.c` | `query_rx_desc()` struct layout varies by chip |
+| `pre_recv_entry()` hook | `core/rtw_recv.c` | Cooperative intercept in the early RX path |
+| `rtw_netdev_ops` export | `os_dep/linux/os_intfs.c` | Must be non-static for sysfs validation |
+| Module parameter | `os_dep/linux/os_intfs.c` | `rtw_cooperative_rx` module_param |
+| Init/deinit lifecycle | `os_dep/linux/usb_intf.c` | `rtw_coop_rx_init/deinit` calls |
+| Makefile | `Makefile` | Add `core/rtw_cooperative_rx.o` to obj list |
+| Monitor mode API | `core/rtw_cooperative_rx.c` | `Ndis802_11Monitor` enum may differ |
+| Channel set API | `core/rtw_cooperative_rx.c` | `set_channel_bwmode()` signature varies |

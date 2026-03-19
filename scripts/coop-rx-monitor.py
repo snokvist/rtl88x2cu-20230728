@@ -76,7 +76,7 @@ def get_iface_info(iface):
                     parts = line.split()
                     info["tx_bytes"] = int(parts[1])
                     info["tx_packets"] = int(parts[3].strip("("))
-    except (subprocess.SubprocessError, ValueError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         pass
     try:
         out = subprocess.check_output(
@@ -88,7 +88,7 @@ def get_iface_info(iface):
                 info["type"] = line.split()[1]
             elif line.startswith("channel "):
                 info["channel"] = line.split()[1]
-    except subprocess.SubprocessError:
+    except (subprocess.SubprocessError, OSError):
         pass
     # For monitor mode helpers, cfg80211 doesn't track the real channel.
     # Read it from the cooperative RX stats (bound_channel) instead.
@@ -268,6 +268,7 @@ def draw(stdscr):
         candidates = stats.get("helper_rx_candidates", 0)
         accepted = stats.get("helper_rx_accepted", 0)
         dup = stats.get("helper_rx_dup_dropped", 0)
+        pool_full = stats.get("helper_rx_pool_full", 0)
         foreign = stats.get("helper_rx_foreign", 0)
         crypto = stats.get("helper_rx_crypto_err", 0)
         late = stats.get("helper_rx_late", 0)
@@ -294,6 +295,11 @@ def draw(stdscr):
         stdscr.addstr(row, 4, f"{'Dup dropped:':<22s}")
         dc = 2 if dup == 0 else 3
         stdscr.addstr(f"{dup:>8,}", curses.color_pair(dc))
+        row += 1
+
+        stdscr.addstr(row, 4, f"{'Pool full:':<22s}")
+        pc = 2 if pool_full == 0 else 1
+        stdscr.addstr(f"{pool_full:>8,}", curses.color_pair(pc))
         row += 1
 
         stdscr.addstr(row, 4, f"{'Foreign BSSID:':<22s}")

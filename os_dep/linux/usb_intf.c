@@ -1532,6 +1532,7 @@ static int __init rtw_drv_entry(void)
 #endif
 		rtw_ndev_notifier_unregister();
 		rtw_inetaddr_notifier_unregister();
+		rtw_coop_rx_deinit();
 		goto exit;
 	}
 
