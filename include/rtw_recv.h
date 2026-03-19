@@ -185,8 +185,6 @@ struct rx_pkt_attrib	{
 
 	u8	ack_policy;
 
-	u8	coop_helper;	/* 1 if frame came from cooperative RX helper */
-
 	u8	key_index;
 
 	u8	data_rate;

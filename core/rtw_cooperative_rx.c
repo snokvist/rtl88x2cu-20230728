@@ -9,9 +9,10 @@
  *
  * Architecture:
  *   - Primary adapter operates normally in STA mode
- *   - Helper adapter(s) are slaved to the same channel/BSSID
- *   - Helper RX frames are validated and injected into primary's
- *     AMPDU reorder window, which provides natural duplicate suppression
+ *   - Helper adapter(s) in monitor mode on the same channel/BSSID
+ *   - Helper RX frames are SW-decrypted and injected into primary's
+ *     recv_func_posthandle() (decrypt → defrag → reorder)
+ *   - CCMP PN replay check + reorder window provide duplicate suppression
  *   - One coherent RX stream is delivered to the network stack
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -134,7 +135,7 @@ int rtw_coop_rx_set_primary(_adapter *adapter)
 	grp->primary = adapter;
 	grp->primary_dvobj = adapter_to_dvobj(adapter);
 
-	if (grp->state == COOP_STATE_IDLE || grp->state == COOP_STATE_DISABLED)
+	if (grp->state == COOP_STATE_DISABLED)
 		grp->state = COOP_STATE_IDLE;
 
 	spin_unlock_irqrestore(&grp->lock, flags);
@@ -362,6 +363,8 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 {
 	struct cooperative_rx_group *grp = READ_ONCE(rtw_coop_rx_group);
 	struct net_device *ndev = helper->pnetdev;
+	u8 bw = CHANNEL_WIDTH_20;
+	u8 offset = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
 
 	/* Set netdev type for radiotap headers */
 	ndev->type = ARPHRD_IEEE80211_RADIOTAP;
@@ -375,12 +378,16 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	rtw_set_802_11_infrastructure_mode(helper, Ndis802_11Monitor, 0);
 	rtw_setopmode_cmd(helper, Ndis802_11Monitor, RTW_CMDF_WAIT_ACK);
 
-	/* Park on the bound channel */
-	set_channel_bwmode(helper, channel,
-			   HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_20);
+	/* Match primary's bandwidth so helper receives all sub-carriers */
+	if (grp && grp->primary) {
+		bw = grp->primary->mlmeextpriv.cur_bwmode;
+		offset = grp->primary->mlmeextpriv.cur_ch_offset;
+	}
 
-	RTW_INFO("%s: helper iface_id=%d set to monitor mode ch=%u\n",
-		 __func__, helper->iface_id, channel);
+	set_channel_bwmode(helper, channel, offset, bw);
+
+	RTW_INFO("%s: helper iface_id=%d set to monitor mode ch=%u bw=%u\n",
+		 __func__, helper->iface_id, channel, bw);
 	return 0;
 }
 
@@ -395,7 +402,7 @@ void rtw_coop_rx_notify_channel_switch(_adapter *adapter)
 	_adapter *helper_snap[COOP_MAX_HELPERS];
 	int snap_count;
 	unsigned long flags;
-	u8 new_ch, old_ch;
+	u8 new_ch, old_ch, new_bw, new_offset;
 	int i;
 
 	if (!rtw_coop_rx_enabled())
@@ -413,27 +420,30 @@ void rtw_coop_rx_notify_channel_switch(_adapter *adapter)
 	}
 
 	new_ch = adapter->mlmeextpriv.cur_channel;
+	new_bw = adapter->mlmeextpriv.cur_bwmode;
+	new_offset = adapter->mlmeextpriv.cur_ch_offset;
 	old_ch = grp->bound_channel;
-	if (new_ch == 0 || new_ch == old_ch) {
+
+	if (new_ch == 0 || (new_ch == old_ch && new_bw == grp->bound_bw)) {
 		spin_unlock_irqrestore(&grp->lock, flags);
 		return;
 	}
 
 	grp->bound_channel = new_ch;
+	grp->bound_bw = new_bw;
 	snap_count = grp->num_helpers;
 	for (i = 0; i < snap_count; i++)
 		helper_snap[i] = grp->helpers[i];
 
 	spin_unlock_irqrestore(&grp->lock, flags);
 
-	RTW_INFO("%s: primary channel changed %u -> %u, moving helpers\n",
-		 __func__, old_ch, new_ch);
+	RTW_INFO("%s: primary channel changed %u -> %u (bw=%u), "
+		 "moving helpers\n", __func__, old_ch, new_ch, new_bw);
 
 	for (i = 0; i < snap_count; i++) {
 		if (helper_snap[i])
 			set_channel_bwmode(helper_snap[i], new_ch,
-					   HAL_PRIME_CHNL_OFFSET_DONT_CARE,
-					   CHANNEL_WIDTH_20);
+					   new_offset, new_bw);
 	}
 }
 
@@ -473,12 +483,13 @@ static bool coop_nonqos_is_dup(struct cooperative_rx_group *grp, u16 seq_num)
 	int i;
 
 	for (i = 0; i < COOP_NONQOS_SEQ_CACHE_SZ; i++) {
-		if (cache->seqs[i] == seq_num)
+		if (cache->valid & BIT(i) && cache->seqs[i] == seq_num)
 			return true;
 	}
 
 	/* Not a dup — record it */
 	cache->seqs[cache->idx] = seq_num;
+	cache->valid |= BIT(cache->idx);
 	cache->idx = (cache->idx + 1) % COOP_NONQOS_SEQ_CACHE_SZ;
 	return false;
 }
@@ -493,12 +504,12 @@ static bool coop_nonqos_is_dup(struct cooperative_rx_group *grp, u16 seq_num)
  * validates it, and injects it into the primary adapter's RX
  * processing.
  *
- * The key insight is that the AMPDU reorder window
- * (recv_indicatepkt_reorder → enqueue_reorder_recvframe) provides
- * natural duplicate suppression: inserting a frame with a sequence
- * number that already has a slot occupied will simply be discarded.
+ * Duplicate suppression uses three layers:
+ *   1. Pre-decrypt PN check — cheaply rejects frames with stale PNs
+ *   2. CCMP MIC verification — rejects remaining dups during SW decrypt
+ *   3. Reorder window — catches any in-window seq_num collisions
  *
- * For non-QoS traffic, we use the nonqos_seq_cache above.
+ * For non-QoS traffic, the nonqos_seq_cache above provides dedup.
  */
 int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 				    _adapter *helper_adapter)
@@ -603,9 +614,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		}
 	}
 
-	/* Mark as cooperative helper frame (suppresses decrypt-fail logs) */
-	pattrib->coop_helper = 1;
-
 	/* Still-encrypted frames that HW should have decrypted but didn't */
 	if (pattrib->encrypt && !pattrib->bdecrypted &&
 	    !pattrib->privacy) {
@@ -659,7 +667,9 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	 * expensive AES decrypt operation on known duplicates.
 	 */
 	if (pattrib->encrypt && !pattrib->bdecrypted &&
-	    pattrib->iv_len >= 8) {
+	    (pattrib->encrypt == _AES_ || pattrib->encrypt == _CCMP_256_ ||
+	     pattrib->encrypt == _GCMP_ || pattrib->encrypt == _GCMP_256_ ||
+	     pattrib->encrypt == _TKIP_)) {
 		struct stainfo_rxcache *prxcache = &psta->sta_recvpriv.rxcache;
 		u8 *iv_ptr = precvframe->u.hdr.rx_data + pattrib->hdrlen;
 		u8 pn[8] = {0}, cached_pn[8] = {0};
@@ -724,12 +734,29 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			   &helper_adapter->recvpriv.free_recv_queue);
 
 	/*
-	 * Submit the primary frame through recv_func_posthandle(), which
-	 * runs: decryptor → defrag → portctrl → reorder.
-	 * This handles SW decryption of encrypted helper frames, as well
-	 * as natural duplicate suppression in the reorder window.
+	 * Submit the primary frame to the appropriate processing path.
+	 *
+	 * Encrypted frames (privacy=1, bdecrypted=0) go through
+	 * recv_func_posthandle() for SW decrypt → defrag → reorder.
+	 *
+	 * Already-decrypted or unencrypted frames skip straight to
+	 * the reorder window for lower overhead.
 	 */
-	ret = recv_func_posthandle(primary, pframe_primary);
+	if (pframe_primary->u.hdr.attrib.encrypt &&
+	    !pframe_primary->u.hdr.attrib.bdecrypted) {
+		ret = recv_func_posthandle(primary, pframe_primary);
+	} else {
+		struct rx_pkt_attrib *pa = &pframe_primary->u.hdr.attrib;
+
+		if (pa->qos) {
+			pframe_primary->u.hdr.preorder_ctrl =
+				&psta->recvreorder_ctrl[pa->priority];
+			ret = recv_indicatepkt_reorder(primary,
+						       pframe_primary);
+		} else {
+			ret = recv_process_mpdu(primary, pframe_primary);
+		}
+	}
 	if (ret == _SUCCESS || ret == RTW_RX_HANDLED) {
 		atomic_inc(&grp->stats.helper_rx_accepted);
 		ret = RTW_RX_HANDLED;
@@ -942,6 +969,20 @@ static ssize_t coop_rx_store_bind(struct device *dev,
 	return count;
 }
 
+static ssize_t coop_rx_store_reset_stats(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct cooperative_rx_group *grp = READ_ONCE(rtw_coop_rx_group);
+
+	if (!grp)
+		return -ENODEV;
+
+	memset(&grp->stats, 0, sizeof(grp->stats));
+	RTW_INFO("coop_rx: stats reset\n");
+	return count;
+}
+
 static DEVICE_ATTR(coop_rx_enabled, 0644,
 		   coop_rx_show_enabled, coop_rx_store_enabled);
 static DEVICE_ATTR(coop_rx_role, 0444, coop_rx_show_role, NULL);
@@ -949,6 +990,7 @@ static DEVICE_ATTR(coop_rx_stats, 0444, coop_rx_show_stats, NULL);
 static DEVICE_ATTR(coop_rx_pair, 0200, NULL, coop_rx_store_pair);
 static DEVICE_ATTR(coop_rx_unpair, 0200, NULL, coop_rx_store_unpair);
 static DEVICE_ATTR(coop_rx_bind, 0200, NULL, coop_rx_store_bind);
+static DEVICE_ATTR(coop_rx_reset_stats, 0200, NULL, coop_rx_store_reset_stats);
 
 static struct attribute *coop_rx_attrs[] = {
 	&dev_attr_coop_rx_enabled.attr,
@@ -957,6 +999,7 @@ static struct attribute *coop_rx_attrs[] = {
 	&dev_attr_coop_rx_pair.attr,
 	&dev_attr_coop_rx_unpair.attr,
 	&dev_attr_coop_rx_bind.attr,
+	&dev_attr_coop_rx_reset_stats.attr,
 	NULL,
 };
 
@@ -1003,8 +1046,7 @@ static int coop_debugfs_stats_show(struct seq_file *s, void *data)
 		   grp->state == COOP_STATE_DISABLED ? "DISABLED" :
 		   grp->state == COOP_STATE_IDLE ? "IDLE" :
 		   grp->state == COOP_STATE_BINDING ? "BINDING" :
-		   grp->state == COOP_STATE_ACTIVE ? "ACTIVE" :
-		   grp->state == COOP_STATE_TEARDOWN ? "TEARDOWN" : "?");
+		   grp->state == COOP_STATE_ACTIVE ? "ACTIVE" : "?");
 	seq_printf(s, "primary:               %s\n",
 		   grp->primary ? "yes" : "no");
 	seq_printf(s, "num_helpers:           %d\n", grp->num_helpers);

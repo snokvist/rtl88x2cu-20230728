@@ -38,7 +38,6 @@ enum coop_rx_state {
 	COOP_STATE_IDLE,
 	COOP_STATE_BINDING,
 	COOP_STATE_ACTIVE,
-	COOP_STATE_TEARDOWN,
 };
 
 /* Statistics counters for observability */
@@ -63,6 +62,7 @@ struct coop_rx_stats {
  */
 struct coop_nonqos_seq_cache {
 	u16 seqs[COOP_NONQOS_SEQ_CACHE_SZ];
+	u32 valid;	/* bitmask of occupied slots (avoids seq 0 false positive) */
 	u8 idx;
 };
 
