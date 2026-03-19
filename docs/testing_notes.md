@@ -137,7 +137,29 @@ All counters are atomic and visible via:
 | `IDLE` | 1 | Cooperative RX enabled, primary set, waiting for bind |
 | `BINDING` | 2 | Helpers paired but session not yet bound to a BSS |
 | `ACTIVE` | 3 | Fully operational — helper frames being merged |
-| `TEARDOWN` | 4 | Shutting down (transient during adapter removal) |
+
+## Multiple Helpers
+
+The cooperative RX code supports up to `COOP_MAX_HELPERS` (4) helpers
+simultaneously. All pairing, binding, channel switching, and teardown
+paths iterate over the full helper array — no code changes needed.
+
+To add additional helpers after the first is paired:
+
+```bash
+# Pair a second helper (must be same chipset/driver)
+echo "wlan2" > /sys/class/net/<primary>/coop_rx/coop_rx_pair
+
+# If session is already bound, re-bind to set up monitor mode on the new helper
+echo 1 > /sys/class/net/<primary>/coop_rx/coop_rx_bind
+```
+
+The `coop-rx-start.sh` script handles one helper. For multiple helpers,
+modify it to unbind/rebind additional USB devices in the same pattern.
+
+Each helper independently contributes frames — the primary's reorder
+window and PN replay check handle dedup across all helpers naturally.
+Stats are aggregated across all helpers (not per-helper).
 
 ## Architecture
 
