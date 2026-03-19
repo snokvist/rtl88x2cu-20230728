@@ -416,24 +416,34 @@ This is a significant engineering effort and is not planned.
 
 ### 9. Porting Guide
 
-Driver-specific touchpoints that must be adapted when porting cooperative
-RX to a different Realtek vendor driver (e.g. rtl8821cu, rtl8812au):
+**Copy these files unchanged** into the target driver:
 
-| Touchpoint | File | Notes |
+- `core/rtw_cooperative_rx.c` — all cooperative RX logic, header parsing,
+  SW decrypt fixup, PN pre-check, sysfs/debugfs interfaces
+- `include/rtw_cooperative_rx.h` — structs, enums, inline helpers
+
+**Add these hooks** (each is 1-4 lines):
+
+| Hook | File | What to add |
 |---|---|---|
-| RX descriptor parsing | `hal/<chip>/rtl<chip>_rxdesc.c` | `query_rx_desc()` struct layout varies by chip |
-| `pre_recv_entry()` hook | `core/rtw_recv.c` | Cooperative intercept in the early RX path |
-| `rtw_netdev_ops` export | `os_dep/linux/os_intfs.c` | Must be non-static for sysfs validation |
-| Module parameter | `os_dep/linux/os_intfs.c` | `rtw_cooperative_rx` module_param |
-| Init/deinit lifecycle | `os_dep/linux/usb_intf.c` | `rtw_coop_rx_init/deinit` calls |
-| Makefile | `Makefile` | Add `core/rtw_cooperative_rx.o` to obj list |
-| Monitor mode API | `core/rtw_cooperative_rx.c` | `Ndis802_11Monitor` enum may differ |
-| Channel set API | `core/rtw_cooperative_rx.c` | `set_channel_bwmode()` signature varies |
-| CSA hook | `core/rtw_cmd.c` | `rtw_dfs_ch_switch_hdl` path — add notify call |
-| Security structs | `include/rtw_security.h` | `GET_ENCRY_ALGO`, `SET_ICE_IV_LEN` macros |
-| PN check | `core/rtw_recv.c` | `recv_ucast_pn_decache` layout, `rxcache.iv[]` |
+| RX intercept | `core/rtw_recv.c` in `pre_recv_entry()` | `if (rtw_coop_rx_pre_recv_entry(...) == RTW_RX_HANDLED) goto exit;` before monitor mode check |
+| CSA follow | `core/rtw_cmd.c` in `rtw_dfs_ch_switch_hdl()` | `rtw_coop_rx_notify_channel_switch(pri_adapter);` after `set_channel_bwmode` + `#include <rtw_cooperative_rx.h>` |
+| Channel set | `core/rtw_mlme_ext.c` in `set_ch_hdl()` | `rtw_coop_rx_notify_channel_switch(padapter);` after channel update |
+| Init/deinit | `os_dep/linux/usb_intf.c` | `rtw_coop_rx_init()` before `usb_register()`, `rtw_coop_rx_deinit()` in exit + error path |
+| Export ops | `os_dep/linux/os_intfs.c` | Remove `static` from `rtw_netdev_ops` |
+| Header decls | `include/rtw_recv.h` | Add `recv_func_posthandle()` extern + PN macros |
+| Makefile | `Makefile` | Add `core/rtw_cooperative_rx.o` to `rtk_core` |
 
-The `core/rtw_cooperative_rx.c` and `include/rtw_cooperative_rx.h` files are
-driver-agnostic and can be copied as-is. The hooks in `rtw_recv.c`,
-`rtw_cmd.c`, `usb_intf.c`, and `os_intfs.c` need manual adaptation per
-driver due to line number differences and minor API variations.
+**Optional noise reduction** (not required for functionality):
+
+| File | Change |
+|---|---|
+| `core/rtw_swcrypto.c` | `RTW_INFO` → `RTW_DBG` for CCMP/GCMP decrypt failure |
+| `os_dep/linux/ioctl_cfg80211.c` | `RTW_INFO` → `RTW_DBG` for `get_txpower`/`get_channel` |
+
+All Realtek vendor drivers from the same generation (libc0607 repos:
+rtl88x2cu, rtl88x2eu, rtl8812au, rtl8812eu) share identical function
+signatures for `pre_recv_entry`, `recv_func_posthandle`, `set_channel_bwmode`,
+`rtw_get_stainfo`, `GET_ENCRY_ALGO`, `SET_ICE_IV_LEN`, and `rtw_iv_to_pn`.
+The hooks are pure insertions — no existing code needs modification beyond
+removing `static` from `rtw_netdev_ops`.

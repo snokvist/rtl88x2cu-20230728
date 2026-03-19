@@ -496,13 +496,98 @@ static bool coop_nonqos_is_dup(struct cooperative_rx_group *grp, u16 seq_num)
 
 /*
  * ============================================================
- * Helper RX Hot Path — Frame Injection
+ * Helper RX Hot Path — Entry Point and Frame Injection
  * ============================================================
+ */
+
+/*
+ * Pre-recv entry hook for cooperative RX helpers.
  *
- * This is the critical function called from the helper adapter's
- * RX tasklet path. It takes a parsed recv_frame from the helper,
- * validates it, and injects it into the primary adapter's RX
- * processing.
+ * Called from pre_recv_entry() in rtw_recv.c. Handles the complete
+ * helper frame lifecycle: 802.11 header parsing, validation, and
+ * submission to the primary's RX path.
+ *
+ * Returns RTW_RX_HANDLED if the frame was consumed (accepted or
+ * rejected), in which case the caller must NOT touch the frame.
+ * Returns _FAIL if this adapter is not a helper or the frame is
+ * not a data frame, in which case normal processing continues.
+ *
+ * This function exists so that the hook in rtw_recv.c is a single
+ * call, making the cooperative RX code easy to port across drivers.
+ */
+int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,
+			       _adapter *adapter, u8 *pbuf, u8 *pphy_status)
+{
+	struct rx_pkt_attrib *pattrib;
+	u8 frame_type, to_fr_ds;
+	int ret;
+
+	if (!unlikely(rtw_coop_rx_is_helper(adapter)))
+		return _FAIL;
+
+	frame_type = GetFrameType(pbuf);
+	if (frame_type != WIFI_DATA_TYPE)
+		return _FAIL; /* non-data: let normal monitor path handle */
+
+	pattrib = &precvframe->u.hdr.attrib;
+
+	/* Query PHY status for RSSI info */
+	if (pphy_status)
+		rx_query_phy_status(precvframe, pphy_status);
+
+	/* Parse 802.11 header — address layout depends on To DS / From DS */
+	to_fr_ds = get_tofr_ds(pbuf);
+	pattrib->to_fr_ds = to_fr_ds;
+	pattrib->seq_num = GetSequence(pbuf);
+	pattrib->frag_num = GetFragNum(pbuf);
+	pattrib->privacy = GetPrivacy(pbuf);
+
+	switch (to_fr_ds) {
+	case 2: /* From DS=1, To DS=0: AP→STA */
+		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->bssid, get_addr2_ptr(pbuf), ETH_ALEN);
+		break;
+	case 1: /* From DS=0, To DS=1: STA→AP */
+		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->bssid, GetAddr1Ptr(pbuf), ETH_ALEN);
+		break;
+	default:
+		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->bssid, GetAddr3Ptr(pbuf), ETH_ALEN);
+		break;
+	}
+
+	/* Parse QoS/TID if present */
+	if ((get_frame_sub_type(pbuf) & WIFI_QOS_DATA_TYPE)
+	    == WIFI_QOS_DATA_TYPE) {
+		u8 a4_shift = (to_fr_ds == 3) ? ETH_ALEN : 0;
+
+		pattrib->qos = 1;
+		pattrib->priority = GetPriority(
+			pbuf + WLAN_HDR_A3_LEN + a4_shift);
+	} else {
+		pattrib->qos = 0;
+		pattrib->priority = 0;
+	}
+
+	ret = rtw_coop_rx_submit_helper_frame(precvframe, adapter);
+	if (ret == RTW_RX_HANDLED)
+		return RTW_RX_HANDLED;
+
+	/* Merge rejected — free the frame back to the helper's pool */
+	rtw_free_recvframe(precvframe,
+			   &adapter->recvpriv.free_recv_queue);
+	return RTW_RX_HANDLED; /* frame consumed either way */
+}
+
+/*
+ * This is the validation and injection function called from
+ * rtw_coop_rx_pre_recv_entry(). It takes a parsed recv_frame from
+ * the helper, validates it, and injects it into the primary
+ * adapter's RX processing.
  *
  * Duplicate suppression uses three layers:
  *   1. Pre-decrypt PN check — cheaply rejects frames with stale PNs

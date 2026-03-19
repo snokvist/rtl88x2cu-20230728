@@ -4854,88 +4854,11 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 	_adapter *primary_padapter = precvframe->u.hdr.adapter;
 	_adapter *iface = NULL;
 
-	/*
-	 * Cooperative RX: if this adapter is a helper, redirect
-	 * data frames to the cooperative merge path instead of
-	 * normal processing. This check runs BEFORE monitor mode
-	 * so the helper can operate in monitor mode (parked on
-	 * channel, no association needed).
-	 */
-	if (unlikely(rtw_coop_rx_is_helper(primary_padapter))) {
-		u8 frame_type = GetFrameType(pbuf);
-
-		if (frame_type == WIFI_DATA_TYPE) {
-			struct rx_pkt_attrib *pattrib =
-				&precvframe->u.hdr.attrib;
-			u8 to_fr_ds;
-
-			/* Query PHY status first for RSSI info */
-			if (pphy_status)
-				rx_query_phy_status(precvframe, pphy_status);
-
-			/*
-			 * Parse 802.11 header fields needed for merge.
-			 * Address layout depends on To DS / From DS bits.
-			 */
-			to_fr_ds = get_tofr_ds(pbuf);
-			pattrib->to_fr_ds = to_fr_ds;
-			pattrib->seq_num = GetSequence(pbuf);
-			pattrib->frag_num = GetFragNum(pbuf);
-			pattrib->privacy = GetPrivacy(pbuf);
-
-			switch (to_fr_ds) {
-			case 2: /* From DS=1, To DS=0: AP→STA */
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid,
-					    get_addr2_ptr(pbuf), ETH_ALEN);
-				break;
-			case 1: /* From DS=0, To DS=1: STA→AP */
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid,
-					    GetAddr1Ptr(pbuf), ETH_ALEN);
-				break;
-			default:
-				_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf),
-					    ETH_ALEN);
-				_rtw_memcpy(pattrib->bssid,
-					    GetAddr3Ptr(pbuf), ETH_ALEN);
-				break;
-			}
-
-			/* Parse QoS/TID if present (QoS data subtype
-			 * has BIT(7)|BIT(3) set in frame control) */
-			if ((get_frame_sub_type(pbuf) & WIFI_QOS_DATA_TYPE)
-			    == WIFI_QOS_DATA_TYPE) {
-				u8 a4_shift = (to_fr_ds == 3) ?
-					      ETH_ALEN : 0;
-				pattrib->qos = 1;
-				pattrib->priority = GetPriority(
-					(pbuf + WLAN_HDR_A3_LEN + a4_shift));
-			} else {
-				pattrib->qos = 0;
-				pattrib->priority = 0;
-			}
-
-			ret = rtw_coop_rx_submit_helper_frame(
-				precvframe, primary_padapter);
-			if (ret == RTW_RX_HANDLED) {
-				goto exit;
-			}
-			/* If merge rejected, free the frame */
-			rtw_free_recvframe(precvframe,
-				&primary_padapter->recvpriv.free_recv_queue);
-			goto exit;
-		}
-		/* Non-data frames (mgmt/ctrl): let helper process normally
-		 * so it can associate and stay on channel */
+	/* Cooperative RX: redirect helper data frames to primary's RX path */
+	if (rtw_coop_rx_pre_recv_entry(precvframe, primary_padapter,
+				       pbuf, pphy_status) == RTW_RX_HANDLED) {
+		ret = _SUCCESS;
+		goto exit;
 	}
 
 #ifdef CONFIG_MP_INCLUDED

@@ -117,7 +117,9 @@ void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
 
-/* Helper RX hot path */
+/* Helper RX hot path — single entry point for pre_recv_entry() hook */
+int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,
+			       _adapter *adapter, u8 *pbuf, u8 *pphy_status);
 int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 				    _adapter *helper_adapter);
 
