@@ -4647,12 +4647,12 @@ static int cfg80211_rtw_get_txpower(struct wiphy *wiphy,
 	if (wdev && wdev_to_ndev(wdev)) {
 		_adapter *adapter = (_adapter *)rtw_netdev_priv(wdev_to_ndev(wdev));
 		mbm = rtw_adapter_get_oper_txpwr_max_mbm(adapter, 1);
-		RTW_INFO(FUNC_ADPT_FMT" total max: %d mbm\n", FUNC_ADPT_ARG(adapter), mbm);
+		RTW_DBG(FUNC_ADPT_FMT" total max: %d mbm\n", FUNC_ADPT_ARG(adapter), mbm);
 	} else
 #endif
 	{
 		mbm = rtw_get_oper_txpwr_max_mbm(dvobj, 1);
-		RTW_INFO(FUNC_WIPHY_FMT" total max: %d mbm\n", FUNC_WIPHY_ARG(wiphy), mbm);
+		RTW_DBG(FUNC_WIPHY_FMT" total max: %d mbm\n", FUNC_WIPHY_ARG(wiphy), mbm);
 	}
 
 	*dbm = mbm / MBM_PDBM;
@@ -6972,7 +6972,7 @@ static int cfg80211_rtw_get_channel(struct wiphy *wiphy,
 
 	if (MLME_IS_ASOC(padapter)) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2)) || defined(CONFIG_MLD_KERNEL_PATCH)
-	RTW_INFO(FUNC_ADPT_FMT" link_id:%d\n", FUNC_ADPT_ARG(padapter), link_id);
+	RTW_DBG(FUNC_ADPT_FMT" link_id:%d\n", FUNC_ADPT_ARG(padapter), link_id);
 #endif
 #ifdef CONFIG_80211N_HT
 		ht_option = padapter->mlmepriv.htpriv.ht_option;
