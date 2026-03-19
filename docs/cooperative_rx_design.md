@@ -378,7 +378,43 @@ With helper paired and active:
 - Revert patch series → all changes in isolated files + minimal hooks
 - Each patch independently revertible in reverse order
 
-### 8. Porting Guide
+### 8. Cross-Driver Compatibility
+
+**Cooperative RX requires both adapters to use the same kernel module.**
+
+Mixing different Realtek drivers (e.g. RTL8822CU primary + RTL8812AU helper)
+is **not possible** for the following architectural reasons:
+
+| Barrier | Detail |
+|---------|--------|
+| Module boundary | `rtw_coop_rx_group` is a per-module global. Two different `.ko` modules have separate instances with no visibility into each other. |
+| Symbol isolation | `recv_func_posthandle()`, `rtw_alloc_recvframe()`, `rtw_get_stainfo()`, and all cooperative RX functions are internal module symbols (no `EXPORT_SYMBOL`). One module cannot call another's functions. |
+| `netdev_ops` check | Sysfs pairing validates `ndev->netdev_ops == &rtw_netdev_ops`. Each `.ko` has its own `rtw_netdev_ops` at a different address — cross-module pairing is rejected. |
+| Struct layout | `_adapter`, `recv_frame`, `rx_pkt_attrib`, `sta_info` sizes depend on CONFIG flags and HAL-layer structs that differ between chip families. Sharing frames across modules would cause memory corruption. |
+| HAL layer | RX descriptor format, `query_rx_desc()`, PHY status parsing, and crypto HW registers are chip-specific. A frame parsed by one chip's HAL cannot be processed by another's. |
+| recv_frame pool | Each adapter has its own 256-frame pool with driver-specific allocation. Cross-module pool sharing is not possible. |
+
+**What DOES work:**
+
+- Two identical chipset adapters (e.g. two RTL8822CU) loaded by the same
+  driver module — this is the tested and supported configuration.
+- The code can be **ported independently** to other Realtek vendor drivers
+  (e.g. rtl8812au, rtl8812eu from [libc0607](https://github.com/libc0607)).
+  After porting, two RTL8812AU adapters could cooperate with each other, and
+  two RTL8812EU adapters with each other, but not across driver boundaries.
+
+**Hypothetical cross-driver support** would require:
+1. A shared kernel module (`rtw-coop-base.ko`) exporting the cooperative
+   group, frame submission, and key query functions
+2. Stable ABI contracts with versioned symbols (`EXPORT_SYMBOL_GPL`)
+3. Unified struct definitions in shared headers
+4. Per-driver translation layers to convert chip-specific `recv_frame` data
+   into a common cooperative frame format
+5. Cross-module device enumeration (similar to kernel bridge/bonding)
+
+This is a significant engineering effort and is not planned.
+
+### 9. Porting Guide
 
 Driver-specific touchpoints that must be adapted when porting cooperative
 RX to a different Realtek vendor driver (e.g. rtl8821cu, rtl8812au):
@@ -393,3 +429,11 @@ RX to a different Realtek vendor driver (e.g. rtl8821cu, rtl8812au):
 | Makefile | `Makefile` | Add `core/rtw_cooperative_rx.o` to obj list |
 | Monitor mode API | `core/rtw_cooperative_rx.c` | `Ndis802_11Monitor` enum may differ |
 | Channel set API | `core/rtw_cooperative_rx.c` | `set_channel_bwmode()` signature varies |
+| CSA hook | `core/rtw_cmd.c` | `rtw_dfs_ch_switch_hdl` path — add notify call |
+| Security structs | `include/rtw_security.h` | `GET_ENCRY_ALGO`, `SET_ICE_IV_LEN` macros |
+| PN check | `core/rtw_recv.c` | `recv_ucast_pn_decache` layout, `rxcache.iv[]` |
+
+The `core/rtw_cooperative_rx.c` and `include/rtw_cooperative_rx.h` files are
+driver-agnostic and can be copied as-is. The hooks in `rtw_recv.c`,
+`rtw_cmd.c`, `usb_intf.c`, and `os_intfs.c` need manual adaptation per
+driver due to line number differences and minor API variations.
