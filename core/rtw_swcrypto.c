@@ -92,7 +92,7 @@ int _rtw_ccmp_decrypt(_adapter * padapter, u8 *key, u32 key_len, uint hdrlen, u8
 	}
 
 	if (plain == NULL) {
-		RTW_INFO("Failed to decrypt CCMP(%u) frame", key_len);
+		RTW_DBG("Failed to decrypt CCMP(%u) frame", key_len);
 		return _FAIL;
 	}
 
@@ -177,7 +177,7 @@ int _rtw_gcmp_decrypt(_adapter *padapter, u8 *key, u32 key_len, uint hdrlen, u8 
 		&plain_len);
 
 	if (plain == NULL) {
-		RTW_INFO("Failed to decrypt GCMP(%u) frame", key_len);
+		RTW_DBG("Failed to decrypt GCMP(%u) frame", key_len);
 		return _FAIL;
 	}
 

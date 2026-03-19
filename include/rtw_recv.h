@@ -185,6 +185,8 @@ struct rx_pkt_attrib	{
 
 	u8	ack_policy;
 
+	u8	coop_helper;	/* 1 if frame came from cooperative RX helper */
+
 	u8	key_index;
 
 	u8	data_rate;
@@ -958,6 +960,10 @@ extern void  mgt_dispatcher(_adapter *padapter, union recv_frame *precv_frame);
 u8 adapter_allow_bmc_data_rx(_adapter *adapter);
 s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status);
 void count_rx_stats(_adapter *padapter, union recv_frame *prframe, struct sta_info *sta);
+
+/* PN replay check — used by cooperative RX pre-decrypt filter */
+#define PN_LESS_CHK(a, b)	(((a-b) & 0x800000000000ULL) != 0)
+#define VALID_PN_CHK(new, old)	(((old) == 0) || PN_LESS_CHK(old, new))
 
 /* Exposed for cooperative RX merge path */
 int recv_indicatepkt_reorder(_adapter *padapter, union recv_frame *prframe);

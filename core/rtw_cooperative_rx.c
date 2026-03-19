@@ -603,6 +603,9 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		}
 	}
 
+	/* Mark as cooperative helper frame (suppresses decrypt-fail logs) */
+	pattrib->coop_helper = 1;
+
 	/* Still-encrypted frames that HW should have decrypted but didn't */
 	if (pattrib->encrypt && !pattrib->bdecrypted &&
 	    !pattrib->privacy) {
@@ -645,6 +648,37 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			atomic_inc(&grp->stats.helper_rx_dup_dropped);
 			rcu_read_unlock();
 			return _FAIL;
+		}
+	}
+
+	/*
+	 * Pre-decrypt PN replay check: extract the packet number from
+	 * the CCMP/GCMP IV header and compare against the primary's
+	 * stored PN. If the PN is stale (already consumed by the
+	 * primary's own copy), skip the frame entirely — avoids the
+	 * expensive AES decrypt operation on known duplicates.
+	 */
+	if (pattrib->encrypt && !pattrib->bdecrypted &&
+	    pattrib->iv_len >= 8) {
+		struct stainfo_rxcache *prxcache = &psta->sta_recvpriv.rxcache;
+		u8 *iv_ptr = precvframe->u.hdr.rx_data + pattrib->hdrlen;
+		u8 pn[8] = {0}, cached_pn[8] = {0};
+		u64 pkt_pn, curr_pn;
+		u8 tid = pattrib->qos ? pattrib->priority : 0;
+
+		if (tid <= 15) {
+			rtw_iv_to_pn(iv_ptr, pn, NULL, pattrib->encrypt);
+			pkt_pn = RTW_GET_LE64(pn);
+
+			rtw_iv_to_pn(prxcache->iv[tid], cached_pn, NULL,
+				     pattrib->encrypt);
+			curr_pn = RTW_GET_LE64(cached_pn);
+
+			if (!VALID_PN_CHK(pkt_pn, curr_pn)) {
+				atomic_inc(&grp->stats.helper_rx_dup_dropped);
+				rcu_read_unlock();
+				return _FAIL;
+			}
 		}
 	}
 
