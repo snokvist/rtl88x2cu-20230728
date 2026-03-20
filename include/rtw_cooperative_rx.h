@@ -102,6 +102,7 @@ struct cooperative_rx_group {
 /* Global singleton — one cooperative group for the system */
 extern struct cooperative_rx_group *rtw_coop_rx_group;
 extern int rtw_cooperative_rx;	/* module parameter */
+extern int rtw_coop_rx_drop_primary;	/* debug: drop primary RX */
 
 /* Lifecycle */
 int rtw_coop_rx_init(void);

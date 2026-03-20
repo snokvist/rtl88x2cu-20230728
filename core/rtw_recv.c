@@ -4861,6 +4861,15 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 		goto exit;
 	}
 
+	/* Debug: drop primary RX data frames to test helper-only path */
+	if (unlikely(READ_ONCE(rtw_coop_rx_drop_primary)) &&
+	    GetFrameType(pbuf) == WIFI_DATA_TYPE) {
+		rtw_free_recvframe(precvframe,
+				   &primary_padapter->recvpriv.free_recv_queue);
+		ret = _SUCCESS;
+		goto exit;
+	}
+
 #ifdef CONFIG_MP_INCLUDED
 	if (rtw_mp_mode_check(primary_padapter))
 		goto query_phy_status;

@@ -35,6 +35,8 @@
 /* Module parameter — 0=disabled (default), 1=enabled */
 int rtw_cooperative_rx = 0;
 
+/* Debug: drop all primary RX data frames to test helper-only path */
+int rtw_coop_rx_drop_primary = 0;
 
 /* Global cooperative group singleton */
 struct cooperative_rx_group *rtw_coop_rx_group = NULL;
@@ -626,14 +628,17 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 
 	atomic_inc(&grp->stats.helper_rx_candidates);
 
-	/* Validate: frame must be from our bound BSSID */
-	if (_rtw_memcmp(pattrib->bssid, grp->bound_bssid, ETH_ALEN) == _FALSE) {
+	/* Only accept downlink frames (AP→STA, From DS=1 To DS=0).
+	 * Uplink frames captured in monitor mode are our own TX echoes
+	 * or other STAs' traffic — useless for cooperative RX. */
+	if (pattrib->to_fr_ds != 2) {
 		atomic_inc(&grp->stats.helper_rx_foreign);
 		rcu_read_unlock();
 		return _FAIL;
 	}
 
-	/* Validate: TA must match bound AP (BSSID = AP MAC in infra BSS) */
+	/* Validate: TA must be our bound AP (BSSID).
+	 * For downlink (to_fr_ds=2): TA = Addr2 = AP MAC. */
 	if (_rtw_memcmp(pattrib->ta, grp->bound_bssid, ETH_ALEN) == _FALSE) {
 		atomic_inc(&grp->stats.helper_rx_foreign);
 		rcu_read_unlock();
@@ -805,6 +810,22 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	pframe_primary->u.hdr.rx_data = precvframe->u.hdr.rx_data;
 	pframe_primary->u.hdr.rx_tail = precvframe->u.hdr.rx_tail;
 	pframe_primary->u.hdr.rx_end = precvframe->u.hdr.rx_end;
+
+	/*
+	 * Strip FCS from monitor-mode helper frames.
+	 *
+	 * Monitor mode intentionally keeps the 4-byte FCS in pkt_len
+	 * (for radiotap), but aes_decipher() computes the MIC offset
+	 * from hdr.len. If the FCS is included, the MIC comparison
+	 * reads from FCS bytes instead of the actual CCMP MIC tag,
+	 * causing every encrypted frame to fail decryption.
+	 */
+#ifdef CONFIG_RX_PACKET_APPEND_FCS
+	if (pframe_primary->u.hdr.len >= IEEE80211_FCS_LEN) {
+		pframe_primary->u.hdr.len -= IEEE80211_FCS_LEN;
+		pframe_primary->u.hdr.rx_tail -= IEEE80211_FCS_LEN;
+	}
+#endif
 
 	/* Associate with PRIMARY adapter context */
 	pframe_primary->u.hdr.adapter = primary;
@@ -1068,6 +1089,28 @@ static ssize_t coop_rx_store_reset_stats(struct device *dev,
 	return count;
 }
 
+static ssize_t coop_rx_show_drop_primary(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(rtw_coop_rx_drop_primary));
+}
+
+static ssize_t coop_rx_store_drop_primary(struct device *dev,
+					   struct device_attribute *attr,
+					   const char *buf, size_t count)
+{
+	int val;
+
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+
+	WRITE_ONCE(rtw_coop_rx_drop_primary, val ? 1 : 0);
+	RTW_INFO("coop_rx: drop_primary_rx = %d\n", val ? 1 : 0);
+	return count;
+}
+
 static DEVICE_ATTR(coop_rx_enabled, 0644,
 		   coop_rx_show_enabled, coop_rx_store_enabled);
 static DEVICE_ATTR(coop_rx_role, 0444, coop_rx_show_role, NULL);
@@ -1076,6 +1119,8 @@ static DEVICE_ATTR(coop_rx_pair, 0200, NULL, coop_rx_store_pair);
 static DEVICE_ATTR(coop_rx_unpair, 0200, NULL, coop_rx_store_unpair);
 static DEVICE_ATTR(coop_rx_bind, 0200, NULL, coop_rx_store_bind);
 static DEVICE_ATTR(coop_rx_reset_stats, 0200, NULL, coop_rx_store_reset_stats);
+static DEVICE_ATTR(coop_rx_drop_primary, 0644,
+		   coop_rx_show_drop_primary, coop_rx_store_drop_primary);
 
 static struct attribute *coop_rx_attrs[] = {
 	&dev_attr_coop_rx_enabled.attr,
@@ -1085,6 +1130,7 @@ static struct attribute *coop_rx_attrs[] = {
 	&dev_attr_coop_rx_unpair.attr,
 	&dev_attr_coop_rx_bind.attr,
 	&dev_attr_coop_rx_reset_stats.attr,
+	&dev_attr_coop_rx_drop_primary.attr,
 	NULL,
 };
 
