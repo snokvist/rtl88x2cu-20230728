@@ -66,6 +66,12 @@ int rtw_coop_rx_init(void)
 	grp->num_helpers = 0;
 	memset(&grp->stats, 0, sizeof(grp->stats));
 
+	/* Init deferred processing queue and tasklet */
+	_rtw_init_queue(&grp->pending_queue);
+	atomic_set(&grp->pending_count, 0);
+	tasklet_init(&grp->coop_rx_tasklet, rtw_coop_rx_drain_tasklet,
+		     (unsigned long)grp);
+
 	/* Publish the group pointer */
 	smp_wmb();
 	WRITE_ONCE(rtw_coop_rx_group, grp);
@@ -91,6 +97,22 @@ void rtw_coop_rx_deinit(void)
 #ifdef CONFIG_DEBUG_FS
 	rtw_coop_rx_debugfs_deinit();
 #endif
+
+	/* Kill the drain tasklet before tearing down state */
+	tasklet_kill(&grp->coop_rx_tasklet);
+
+	/* Drain remaining pending frames back to primary's free pool */
+	{
+		union recv_frame *pframe;
+		_adapter *primary = grp->primary;
+
+		while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
+			atomic_dec(&grp->pending_count);
+			if (primary)
+				rtw_free_recvframe(pframe,
+					&primary->recvpriv.free_recv_queue);
+		}
+	}
 
 	spin_lock_irqsave(&grp->lock, flags);
 	grp->state = COOP_STATE_DISABLED;
@@ -270,8 +292,24 @@ void rtw_coop_rx_remove_adapter(_adapter *adapter)
 	/* Check if it's the primary */
 	spin_lock_irqsave(&grp->lock, flags);
 	if (grp->primary == adapter) {
+		spin_unlock_irqrestore(&grp->lock, flags);
+
 		RTW_INFO("%s: primary adapter removed, tearing down "
 			 "cooperative group\n", __func__);
+
+		/* Kill tasklet and drain pending frames before clearing primary */
+		tasklet_kill(&grp->coop_rx_tasklet);
+		{
+			union recv_frame *pframe;
+
+			while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
+				atomic_dec(&grp->pending_count);
+				rtw_free_recvframe(pframe,
+					&adapter->recvpriv.free_recv_queue);
+			}
+		}
+
+		spin_lock_irqsave(&grp->lock, flags);
 		grp->primary = NULL;
 		grp->primary_dvobj = NULL;
 		grp->num_helpers = 0;
@@ -458,6 +496,21 @@ void rtw_coop_rx_unbind_session(void)
 	if (!grp)
 		return;
 
+	/* Stop the drain tasklet and drain pending frames */
+	tasklet_disable(&grp->coop_rx_tasklet);
+	{
+		union recv_frame *pframe;
+		_adapter *primary = grp->primary;
+
+		while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
+			atomic_dec(&grp->pending_count);
+			if (primary)
+				rtw_free_recvframe(pframe,
+					&primary->recvpriv.free_recv_queue);
+		}
+	}
+	tasklet_enable(&grp->coop_rx_tasklet);
+
 	spin_lock_irqsave(&grp->lock, flags);
 	if (grp->state == COOP_STATE_ACTIVE ||
 	    grp->state == COOP_STATE_BINDING) {
@@ -524,7 +577,7 @@ int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,
 	u8 frame_type, to_fr_ds;
 	int ret;
 
-	if (!unlikely(rtw_coop_rx_is_helper(adapter)))
+	if (!rtw_coop_rx_is_helper(adapter))
 		return _FAIL;
 
 	frame_type = GetFrameType(pbuf);
@@ -548,16 +601,22 @@ int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,
 	case 2: /* From DS=1, To DS=0: AP→STA */
 		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->dst, GetAddr1Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->src, GetAddr3Ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->bssid, get_addr2_ptr(pbuf), ETH_ALEN);
 		break;
 	case 1: /* From DS=0, To DS=1: STA→AP */
 		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->dst, GetAddr3Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->src, get_addr2_ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->bssid, GetAddr1Ptr(pbuf), ETH_ALEN);
 		break;
 	default:
 		_rtw_memcpy(pattrib->ra, GetAddr1Ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->ta, get_addr2_ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->dst, GetAddr1Ptr(pbuf), ETH_ALEN);
+		_rtw_memcpy(pattrib->src, get_addr2_ptr(pbuf), ETH_ALEN);
 		_rtw_memcpy(pattrib->bssid, GetAddr3Ptr(pbuf), ETH_ALEN);
 		break;
 	}
@@ -831,6 +890,16 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	pframe_primary->u.hdr.adapter = primary;
 	pframe_primary->u.hdr.psta = psta;
 
+	/* Set reorder control pointer for the drain tasklet.
+	 * Normally set by validate_recv() which we bypass.
+	 * recv_func_posthandle() → recv_indicatepkt_reorder()
+	 * reads this to find the correct reorder window. */
+	if (pattrib->qos && !IS_MCAST(pattrib->ra))
+		pframe_primary->u.hdr.preorder_ctrl =
+			&psta->recvreorder_ctrl[pattrib->priority];
+	else
+		pframe_primary->u.hdr.preorder_ctrl = NULL;
+
 	/*
 	 * Free the helper's recv_frame back to the helper's pool NOW.
 	 * The skb has been transferred (pkt==NULL), so rtw_os_free_recvframe
@@ -840,38 +909,145 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			   &helper_adapter->recvpriv.free_recv_queue);
 
 	/*
-	 * Submit the primary frame to the appropriate processing path.
-	 *
-	 * Encrypted frames (privacy=1, bdecrypted=0) go through
-	 * recv_func_posthandle() for SW decrypt → defrag → reorder.
-	 *
-	 * Already-decrypted or unencrypted frames skip straight to
-	 * the reorder window for lower overhead.
+	 * Deferred processing: enqueue to pending_queue and schedule
+	 * the drain tasklet. This decouples the helper's softirq
+	 * from the primary's recv path, avoiding contention that
+	 * caused 60-86% packet loss on the primary at high rates.
 	 */
-	if (pframe_primary->u.hdr.attrib.encrypt &&
-	    !pframe_primary->u.hdr.attrib.bdecrypted) {
-		ret = recv_func_posthandle(primary, pframe_primary);
-	} else {
-		struct rx_pkt_attrib *pa = &pframe_primary->u.hdr.attrib;
+	if (atomic_read(&grp->pending_count) >= COOP_PENDING_MAX) {
+		atomic_inc(&grp->stats.helper_rx_backpressure);
+		rtw_free_recvframe(pframe_primary,
+				   &primary->recvpriv.free_recv_queue);
+		rcu_read_unlock();
+		return RTW_RX_HANDLED;
+	}
 
-		if (pa->qos) {
-			pframe_primary->u.hdr.preorder_ctrl =
-				&psta->recvreorder_ctrl[pa->priority];
-			ret = recv_indicatepkt_reorder(primary,
-						       pframe_primary);
-		} else {
-			ret = recv_process_mpdu(primary, pframe_primary);
-		}
-	}
-	if (ret == _SUCCESS || ret == RTW_RX_HANDLED) {
-		atomic_inc(&grp->stats.helper_rx_accepted);
-		ret = RTW_RX_HANDLED;
-	} else {
-		atomic_inc(&grp->stats.helper_rx_dup_dropped);
-	}
+	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
+	atomic_inc(&grp->pending_count);
+	atomic_inc(&grp->stats.helper_rx_deferred);
+	tasklet_schedule(&grp->coop_rx_tasklet);
 
 	rcu_read_unlock();
-	return ret;
+	return RTW_RX_HANDLED;
+}
+
+/*
+ * ============================================================
+ * Drain Tasklet — Deferred Helper Frame Processing
+ * ============================================================
+ *
+ * Processes frames enqueued by rtw_coop_rx_submit_helper_frame().
+ * Runs in its own softirq context, decoupled from the helper's
+ * USB recv_tasklet, eliminating contention on the primary's
+ * recv path that caused packet loss at high frame rates.
+ */
+void rtw_coop_rx_drain_tasklet(unsigned long data)
+{
+	struct cooperative_rx_group *grp = (struct cooperative_rx_group *)data;
+	_adapter *primary;
+	union recv_frame *pframe;
+	int processed = 0;
+	int ret;
+
+	rcu_read_lock();
+
+	primary = READ_ONCE(grp->primary);
+	if (!primary || rtw_is_drv_stopped(primary) ||
+	    READ_ONCE(grp->state) != COOP_STATE_ACTIVE) {
+		rcu_read_unlock();
+		return;
+	}
+
+	while (processed < COOP_BATCH_SIZE) {
+		struct rx_pkt_attrib *pa;
+		struct sta_info *psta;
+
+		pframe = rtw_alloc_recvframe(&grp->pending_queue);
+		if (!pframe)
+			break;
+
+		atomic_dec(&grp->pending_count);
+
+		pa = &pframe->u.hdr.attrib;
+		psta = pframe->u.hdr.psta;
+
+		/*
+		 * Dedup mirroring recv_decache(): compare the frame's
+		 * seq_ctrl against the primary's cached rxseq.  If they
+		 * match, the primary already processed this frame.
+		 *
+		 * Crucially, we also WRITE rxseq on pass — this creates
+		 * bidirectional dedup on SMP: if the drain tasklet runs
+		 * before the primary's recv_decache, our write causes
+		 * the primary's subsequent recv_decache to see a match
+		 * and drop its copy.  Whoever updates rxseq first wins;
+		 * the other path sees seq_ctrl == *prxseq and drops.
+		 */
+		if (psta) {
+			u16 seq_ctrl = (pa->seq_num << 4) |
+				       (pa->frag_num & 0xf);
+			u16 *prxseq;
+			sint tid = pa->priority;
+
+			if (tid > 15)
+				tid = 0;
+
+			if (pa->qos) {
+				if (IS_MCAST(pa->ra))
+					prxseq = &psta->sta_recvpriv
+						  .bmc_tid_rxseq[tid];
+				else
+					prxseq = &psta->sta_recvpriv.rxcache
+						  .tid_rxseq[tid];
+			} else {
+				if (IS_MCAST(pa->ra))
+					prxseq = &psta->sta_recvpriv
+						  .nonqos_bmc_rxseq;
+				else
+					prxseq = &psta->sta_recvpriv
+						  .nonqos_rxseq;
+			}
+
+			if (seq_ctrl == READ_ONCE(*prxseq)) {
+				atomic_inc(&grp->stats.helper_rx_dup_dropped);
+				rtw_free_recvframe(pframe,
+					&primary->recvpriv.free_recv_queue);
+				processed++;
+				continue;
+			}
+
+			/* Claim this frame — primary's recv_decache
+			 * will see our write and drop its copy */
+			WRITE_ONCE(*prxseq, seq_ctrl);
+		}
+
+		/* Frame is not a dup — process it */
+		if (pa->encrypt && !pa->bdecrypted) {
+			ret = recv_func_posthandle(primary, pframe);
+		} else {
+			if (pa->qos) {
+				if (psta)
+					pframe->u.hdr.preorder_ctrl =
+						&psta->recvreorder_ctrl[pa->priority];
+				ret = recv_indicatepkt_reorder(primary, pframe);
+			} else {
+				ret = recv_process_mpdu(primary, pframe);
+			}
+		}
+
+		if (ret == _SUCCESS || ret == RTW_RX_HANDLED)
+			atomic_inc(&grp->stats.helper_rx_accepted);
+		else
+			atomic_inc(&grp->stats.helper_rx_dup_dropped);
+
+		processed++;
+	}
+
+	/* If queue still has frames, reschedule */
+	if (atomic_read(&grp->pending_count) > 0)
+		tasklet_schedule(&grp->coop_rx_tasklet);
+
+	rcu_read_unlock();
 }
 
 /*
@@ -954,6 +1130,9 @@ static ssize_t coop_rx_show_stats(struct device *dev,
 		"helper_rx_crypto_err: %d\n"
 		"helper_rx_late: %d\n"
 		"helper_rx_no_sta: %d\n"
+		"helper_rx_deferred: %d\n"
+		"helper_rx_backpressure: %d\n"
+		"pending_count: %d\n"
 		"fallback_events: %d\n"
 		"pair_events: %d\n"
 		"unpair_events: %d\n",
@@ -969,6 +1148,9 @@ static ssize_t coop_rx_show_stats(struct device *dev,
 		atomic_read(&grp->stats.helper_rx_crypto_err),
 		atomic_read(&grp->stats.helper_rx_late),
 		atomic_read(&grp->stats.helper_rx_no_sta),
+		atomic_read(&grp->stats.helper_rx_deferred),
+		atomic_read(&grp->stats.helper_rx_backpressure),
+		atomic_read(&grp->pending_count),
 		atomic_read(&grp->stats.fallback_events),
 		atomic_read(&grp->stats.pair_events),
 		atomic_read(&grp->stats.unpair_events));
@@ -1111,10 +1293,113 @@ static ssize_t coop_rx_store_drop_primary(struct device *dev,
 	return count;
 }
 
+/*
+ * coop_rx_info — machine-parseable cooperative setup summary.
+ * Reports per-interface details using driver-internal data so
+ * userspace doesn't need to call iw (which reports stale channel
+ * info for monitor-mode helpers).
+ *
+ * Format: key=value lines, one per field.
+ */
+static ssize_t coop_rx_show_info(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct cooperative_rx_group *grp = READ_ONCE(rtw_coop_rx_group);
+	int len = 0;
+	int i;
+
+	if (!grp) {
+		return scnprintf(buf, PAGE_SIZE, "state=DISABLED\n");
+	}
+
+	/* Group-level info */
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		"state=%d\n"
+		"state_name=%s\n"
+		"bssid="MAC_FMT"\n"
+		"channel=%u\n"
+		"bw=%u\n"
+		"num_helpers=%d\n"
+		"drop_primary=%d\n",
+		grp->state,
+		grp->state == COOP_STATE_ACTIVE ? "ACTIVE" :
+		grp->state == COOP_STATE_BINDING ? "BINDING" :
+		grp->state == COOP_STATE_IDLE ? "IDLE" : "DISABLED",
+		MAC_ARG(grp->bound_bssid),
+		grp->bound_channel,
+		grp->bound_bw,
+		grp->num_helpers,
+		READ_ONCE(rtw_coop_rx_drop_primary));
+
+	/* Primary interface info */
+	if (grp->primary) {
+		_adapter *pri = grp->primary;
+		struct mlme_priv *pmlmepriv = &pri->mlmepriv;
+		struct mlme_ext_priv *pmlmeext = &pri->mlmeextpriv;
+		struct recv_priv *precvpriv = &pri->recvpriv;
+		WLAN_BSSID_EX *cur = &pmlmepriv->cur_network.network;
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"primary_iface=%s\n"
+			"primary_channel=%u\n"
+			"primary_rssi=%d\n"
+			"primary_signal=%u\n",
+			pri->pnetdev ? pri->pnetdev->name : "?",
+			pmlmeext->cur_channel,
+			precvpriv->rssi,
+			precvpriv->signal_strength);
+
+		if (check_fwstate(pmlmepriv, WIFI_ASOC_STATE) &&
+		    cur->Ssid.SsidLength > 0 &&
+		    cur->Ssid.SsidLength <= 32) {
+			/* Safe SSID output — replace non-printable chars */
+			char ssid_buf[33];
+			u32 slen = cur->Ssid.SsidLength;
+			u32 j;
+
+			memcpy(ssid_buf, cur->Ssid.Ssid, slen);
+			ssid_buf[slen] = '\0';
+			for (j = 0; j < slen; j++) {
+				if (ssid_buf[j] < 0x20 || ssid_buf[j] > 0x7e)
+					ssid_buf[j] = '?';
+			}
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				"primary_ssid=%s\n"
+				"primary_connected=1\n",
+				ssid_buf);
+		} else {
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+				"primary_ssid=\n"
+				"primary_connected=0\n");
+		}
+	}
+
+	/* Helper interface(s) info */
+	for (i = 0; i < grp->num_helpers && i < COOP_MAX_HELPERS; i++) {
+		_adapter *hlp = grp->helpers[i];
+
+		if (!hlp)
+			continue;
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"helper%d_iface=%s\n"
+			"helper%d_channel=%u\n"
+			"helper%d_rssi=%d\n"
+			"helper%d_signal=%u\n",
+			i, hlp->pnetdev ? hlp->pnetdev->name : "?",
+			i, grp->bound_channel,  /* helper tunes to bound ch */
+			i, hlp->recvpriv.rssi,
+			i, hlp->recvpriv.signal_strength);
+	}
+
+	return len;
+}
+
 static DEVICE_ATTR(coop_rx_enabled, 0644,
 		   coop_rx_show_enabled, coop_rx_store_enabled);
 static DEVICE_ATTR(coop_rx_role, 0444, coop_rx_show_role, NULL);
 static DEVICE_ATTR(coop_rx_stats, 0444, coop_rx_show_stats, NULL);
+static DEVICE_ATTR(coop_rx_info, 0444, coop_rx_show_info, NULL);
 static DEVICE_ATTR(coop_rx_pair, 0200, NULL, coop_rx_store_pair);
 static DEVICE_ATTR(coop_rx_unpair, 0200, NULL, coop_rx_store_unpair);
 static DEVICE_ATTR(coop_rx_bind, 0200, NULL, coop_rx_store_bind);
@@ -1126,6 +1411,7 @@ static struct attribute *coop_rx_attrs[] = {
 	&dev_attr_coop_rx_enabled.attr,
 	&dev_attr_coop_rx_role.attr,
 	&dev_attr_coop_rx_stats.attr,
+	&dev_attr_coop_rx_info.attr,
 	&dev_attr_coop_rx_pair.attr,
 	&dev_attr_coop_rx_unpair.attr,
 	&dev_attr_coop_rx_bind.attr,
@@ -1202,6 +1488,12 @@ static int coop_debugfs_stats_show(struct seq_file *s, void *data)
 		   atomic_read(&grp->stats.helper_rx_late));
 	seq_printf(s, "helper_rx_no_sta:      %d\n",
 		   atomic_read(&grp->stats.helper_rx_no_sta));
+	seq_printf(s, "helper_rx_deferred:    %d\n",
+		   atomic_read(&grp->stats.helper_rx_deferred));
+	seq_printf(s, "helper_rx_backpressure:%d\n",
+		   atomic_read(&grp->stats.helper_rx_backpressure));
+	seq_printf(s, "pending_count:         %d\n",
+		   atomic_read(&grp->pending_count));
 	seq_printf(s, "fallback_events:       %d\n",
 		   atomic_read(&grp->stats.fallback_events));
 	seq_printf(s, "pair_events:           %d\n",

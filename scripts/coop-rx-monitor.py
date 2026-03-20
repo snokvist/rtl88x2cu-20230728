@@ -2,12 +2,14 @@
 """
 coop-rx-monitor — Interactive monitor for RTL8822CU cooperative RX diversity
 
-Reads /sys/kernel/debug/rtw_coop_rx/stats and network interface counters
-to display a live dashboard of cooperative RX performance.
+Reads /sys/kernel/debug/rtw_coop_rx/stats and the driver's coop_rx_info
+sysfs endpoint to display a live dashboard of cooperative RX performance.
 
-Usage: sudo python3 coop-rx-monitor.py
+Usage:
+  sudo python3 coop-rx-monitor.py           # curses TUI dashboard
+  sudo python3 coop-rx-monitor.py --status  # one-shot stdout summary
 
-Keys:
+Keys (TUI mode):
   q / ESC  — quit
   r        — reset cooperative RX stats
   d        — toggle drop_primary (helper-only test mode)
@@ -16,7 +18,6 @@ Keys:
 import curses
 import time
 import os
-import subprocess
 import sys
 
 STATS_PATH = "/sys/kernel/debug/rtw_coop_rx/stats"
@@ -64,57 +65,17 @@ def parse_stats():
     return stats
 
 
-def get_iface_stats(iface):
-    """Read kernel network interface byte/packet counters (stack-level)."""
-    base = f"/sys/class/net/{iface}/statistics"
-    result = {}
-    for name in ("rx_bytes", "rx_packets", "tx_bytes", "tx_packets"):
-        val = read_file(f"{base}/{name}")
-        result[name] = int(val) if val else 0
-    return result
-
-
-def get_iface_info(iface):
-    """Get link info from iw dev."""
-    info = {"connected": False, "ssid": "", "freq": "", "signal": "",
-            "type": "managed", "channel": "",
-            "rx_bitrate": "", "tx_bitrate": ""}
-    try:
-        out = subprocess.check_output(
-            ["iw", "dev", iface, "link"], stderr=subprocess.DEVNULL, timeout=2
-        ).decode()
-        if "Connected" in out:
-            info["connected"] = True
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("SSID:"):
-                    info["ssid"] = line.split(":", 1)[1].strip()
-                elif "freq:" in line:
-                    info["freq"] = line.split("freq:")[1].strip().split()[0]
-                elif "signal:" in line:
-                    info["signal"] = line.split("signal:")[1].strip()
-                elif line.startswith("rx bitrate:"):
-                    info["rx_bitrate"] = line.split(":", 1)[1].strip()
-                elif line.startswith("tx bitrate:"):
-                    info["tx_bitrate"] = line.split(":", 1)[1].strip()
-    except (subprocess.SubprocessError, OSError, ValueError):
-        pass
-    try:
-        out = subprocess.check_output(
-            ["iw", "dev", iface, "info"], stderr=subprocess.DEVNULL, timeout=2
-        ).decode()
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("type "):
-                info["type"] = line.split()[1]
-            elif line.startswith("channel "):
-                info["channel"] = line.split()[1]
-    except (subprocess.SubprocessError, OSError):
-        pass
-    if info["type"] == "monitor" and not info["channel"]:
-        stats = parse_stats()
-        if stats and "bound_channel" in stats:
-            info["channel"] = str(stats["bound_channel"])
+def parse_info(primary):
+    """Read coop_rx_info sysfs — key=value per line."""
+    path = f"/sys/class/net/{primary}/coop_rx/coop_rx_info"
+    raw = read_file(path)
+    if not raw:
+        return {}
+    info = {}
+    for line in raw.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            info[k.strip()] = v.strip()
     return info
 
 
@@ -156,7 +117,6 @@ def fmt_pps(pps):
 
 
 def ema(prev, cur, alpha=EMA_ALPHA):
-    """Exponential moving average for smooth rate display."""
     if prev is None:
         return cur
     return alpha * cur + (1 - alpha) * prev
@@ -167,7 +127,6 @@ STATE_COLORS = {0: 1, 1: 3, 2: 3, 3: 2}  # 1=red, 2=green, 3=yellow
 
 
 def safe_addstr(stdscr, row, col, text, *args):
-    """addstr that silently ignores writes beyond terminal bounds."""
     h, w = stdscr.getmaxyx()
     if row >= h - 1 or col >= w:
         return
@@ -177,6 +136,97 @@ def safe_addstr(stdscr, row, col, text, *args):
     except curses.error:
         pass
 
+
+# ---- stdout --status mode ----------------------------------------------------
+
+def print_status():
+    """One-shot status dump to stdout."""
+    primary, helper = find_coop_ifaces()
+    if not primary:
+        print("No primary interface found — is module loaded with rtw_cooperative_rx=1?")
+        sys.exit(1)
+
+    info = parse_info(primary)
+    stats = parse_stats()
+
+    state_name = info.get("state_name", "?")
+    bssid = info.get("bssid", "?")
+    channel = info.get("channel", "?")
+    bw = info.get("bw", "0")
+    drop_primary = info.get("drop_primary", "0")
+
+    # Primary info
+    pri_iface = info.get("primary_iface", primary)
+    pri_ch = info.get("primary_channel", "?")
+    pri_rssi = info.get("primary_rssi", "?")
+    pri_signal = info.get("primary_signal", "?")
+    pri_ssid = info.get("primary_ssid", "")
+    pri_connected = info.get("primary_connected", "0") == "1"
+
+    # Helper info
+    hlp_iface = info.get("helper0_iface", helper or "none")
+    hlp_ch = info.get("helper0_channel", "?")
+    hlp_rssi = info.get("helper0_rssi", "?")
+    hlp_signal = info.get("helper0_signal", "?")
+
+    print(f"=== Cooperative RX Diversity ===")
+    pri_ch_tag = ""
+    if pri_ch != channel:
+        pri_ch_tag = f"  (pri: {pri_ch}) MISMATCH"
+    else:
+        pri_ch_tag = f"  (pri: {pri_ch})"
+    print(f"State:   {state_name}  BSSID: {bssid}  Ch: {channel}{pri_ch_tag}  BW: {bw}")
+    if drop_primary == "1":
+        print(f"         drop_primary: ON")
+    print()
+
+    # Primary
+    status = "CONNECTED" if pri_connected else "DOWN"
+    ssid_part = f"  {pri_ssid}" if pri_ssid else ""
+    rssi_part = f"  {pri_rssi} dBm (signal {pri_signal}%)" if pri_rssi != "?" else ""
+    print(f"  PRIMARY  {pri_iface:<24s} [{status}] ch={pri_ch}{rssi_part}{ssid_part}")
+
+    # Helper
+    if hlp_iface and hlp_iface != "none":
+        rssi_part = ""
+        if hlp_rssi != "?" and hlp_rssi != "0":
+            rssi_part = f"  {hlp_rssi} dBm (signal {hlp_signal}%)"
+        # Check helper link state via interface flags (IFF_UP = 0x1)
+        hlp_link = "?"
+        hlp_flags_str = read_file(f"/sys/class/net/{hlp_iface}/flags")
+        if hlp_flags_str:
+            hlp_flags = int(hlp_flags_str, 16)
+            hlp_link = "UP" if (hlp_flags & 0x1) else "DOWN"
+        print(f"  HELPER   {hlp_iface:<24s} [monitor {hlp_link}]  ch={hlp_ch}{rssi_part}")
+    else:
+        print(f"  HELPER   (none paired)")
+
+    if stats:
+        print()
+        accepted = stats.get("helper_rx_accepted", 0)
+        dup = stats.get("helper_rx_dup_dropped", 0)
+        candidates = stats.get("helper_rx_candidates", 0)
+        foreign = stats.get("helper_rx_foreign", 0)
+        crypto = stats.get("helper_rx_crypto_err", 0)
+        late = stats.get("helper_rx_late", 0)
+        deferred = stats.get("helper_rx_deferred", 0)
+        pending = stats.get("pending_count", 0)
+        backpressure = stats.get("helper_rx_backpressure", 0)
+
+        decided = accepted + dup
+        contrib = (accepted / decided * 100) if decided > 0 else 0
+
+        print(f"  Candidates:  {candidates:>8,}  (foreign: {foreign:,})")
+        print(f"  Accepted:    {accepted:>8,}")
+        print(f"  Dup dropped: {dup:>8,}")
+        print(f"  Late:        {late:>8,}")
+        print(f"  Crypto err:  {crypto:>8,}")
+        print(f"  Deferred:    {deferred:>8,}  pending: {pending}  backpressure: {backpressure}")
+        if decided > 0:
+            print(f"  Helper contribution: {contrib:.1f}%  ({accepted:,} / {decided:,} decided)")
+
+
+# ---- curses TUI mode ---------------------------------------------------------
 
 def draw(stdscr):
     curses.curs_set(0)
@@ -194,20 +244,19 @@ def draw(stdscr):
 
     prev_stats = None
     prev_time = None
-    prev_net = {}  # {iface: {rx_bytes, rx_packets, ...}}
+    prev_net = {}
     flash_msg = ""
     flash_until = 0.0
-
-    # Smoothed rates
     rates = {}
 
     while True:
+        primary, helper = find_coop_ifaces()
+
         try:
             key = stdscr.getch()
             if key in (ord("q"), ord("Q"), 27):
                 break
             elif key in (ord("r"), ord("R")):
-                primary, _ = find_coop_ifaces()
                 if primary:
                     path = f"/sys/class/net/{primary}/coop_rx/coop_rx_reset_stats"
                     if write_file(path, "1"):
@@ -218,7 +267,6 @@ def draw(stdscr):
                         flash_msg = "Reset failed (permission?)"
                     flash_until = time.monotonic() + 2.0
             elif key in (ord("d"), ord("D")):
-                primary, _ = find_coop_ifaces()
                 if primary:
                     path = f"/sys/class/net/{primary}/coop_rx/coop_rx_drop_primary"
                     cur = read_file(path)
@@ -232,59 +280,48 @@ def draw(stdscr):
             pass
 
         stats = parse_stats()
-        primary, helper = find_coop_ifaces()
         now = time.monotonic()
         dt = (now - prev_time) if prev_time else 0
+
+        # Read coop_rx_info from driver sysfs
+        info = parse_info(primary) if primary else {}
 
         # Read interface byte counters
         cur_net = {}
         for iface in (primary, helper):
             if iface:
-                cur_net[iface] = get_iface_stats(iface)
+                base = f"/sys/class/net/{iface}/statistics"
+                cur_net[iface] = {}
+                for name in ("rx_bytes", "rx_packets"):
+                    val = read_file(f"{base}/{name}")
+                    cur_net[iface][name] = int(val) if val else 0
 
         # Calculate rates
         if stats and prev_stats and dt > 0:
             for counter in ("helper_rx_candidates", "helper_rx_accepted",
                             "helper_rx_dup_dropped", "helper_rx_foreign",
                             "helper_rx_crypto_err", "helper_rx_late",
-                            "helper_rx_no_sta", "helper_rx_pool_full"):
+                            "helper_rx_no_sta", "helper_rx_pool_full",
+                            "helper_rx_deferred", "helper_rx_backpressure"):
                 raw = (stats.get(counter, 0) - prev_stats.get(counter, 0)) / dt
                 rates[counter] = ema(rates.get(counter), raw)
 
-        # Interface byte rates
         for iface in (primary, helper):
             if iface and iface in cur_net and iface in prev_net and dt > 0:
                 rx_bps = (cur_net[iface]["rx_bytes"] - prev_net[iface]["rx_bytes"]) * 8 / dt
-                rx_pps = (cur_net[iface]["rx_packets"] - prev_net[iface]["rx_packets"]) / dt
                 rates[f"{iface}_rx_bps"] = ema(rates.get(f"{iface}_rx_bps"), rx_bps)
-                rates[f"{iface}_rx_pps"] = ema(rates.get(f"{iface}_rx_pps"), rx_pps)
 
         prev_stats = stats
         prev_time = now
         prev_net = cur_net
 
-        # Get link-level info (less frequently — iw is slow)
-        # Only refresh every ~2s to avoid iw overhead
-        iw_stale = not hasattr(draw, '_iw_cache') or now - draw._iw_ts > 2.0
-        if iw_stale:
-            draw._iw_cache = {}
-            for iface in (primary, helper):
-                if iface:
-                    draw._iw_cache[iface] = get_iface_info(iface)
-            draw._iw_ts = now
-        pri_info = draw._iw_cache.get(primary, {}) if primary else {}
-        hlp_info = draw._iw_cache.get(helper, {}) if helper else {}
-
-        # Read drop_primary state
-        drop_primary = False
-        if primary:
-            dp = read_file(f"/sys/class/net/{primary}/coop_rx/coop_rx_drop_primary")
-            drop_primary = dp and dp.strip() == "1"
+        # Read drop_primary state from info
+        drop_primary = info.get("drop_primary", "0") == "1"
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        if h < 24 or w < 72:
-            safe_addstr(stdscr, 0, 0, f"Terminal too small ({w}x{h}, need 72x24)")
+        if h < 28 or w < 72:
+            safe_addstr(stdscr, 0, 0, f"Terminal too small ({w}x{h}, need 72x28)")
             stdscr.refresh()
             time.sleep(0.5)
             continue
@@ -308,53 +345,71 @@ def draw(stdscr):
             time.sleep(1.0 / REFRESH_HZ)
             continue
 
-        # === State line ===
+        # === State line (from driver sysfs info) ===
         state_num = stats.get("state", 0)
-        state_name = STATE_NAMES.get(state_num, "?")
+        state_name = info.get("state_name", STATE_NAMES.get(state_num, "?"))
         state_color = STATE_COLORS.get(state_num, 5)
         safe_addstr(stdscr, row, 2, "State: ", BOLD)
         safe_addstr(stdscr, row, 9, state_name,
                     BOLD | curses.color_pair(state_color))
         col = 9 + len(state_name) + 2
-        bssid = stats.get("bound_bssid", "\u2014")
-        ch = stats.get("bound_channel", "\u2014")
-        safe_addstr(stdscr, row, col,
-                    f"BSSID: {bssid}  Ch: {ch}")
+        bssid = info.get("bssid", stats.get("bound_bssid", "\u2014"))
+        ch = info.get("channel", str(stats.get("bound_channel", "\u2014")))
+        pri_ch = info.get("primary_channel", ch)
+        ch_str = f"BSSID: {bssid}  Ch: {ch}"
+        safe_addstr(stdscr, row, col, ch_str)
+        pcol = col + len(ch_str) + 1
+        if str(pri_ch) != str(ch):
+            safe_addstr(stdscr, row, pcol, f"(pri: {pri_ch}) MISMATCH",
+                        BOLD | curses.color_pair(1))
+        else:
+            safe_addstr(stdscr, row, pcol, f"(pri: {pri_ch})",
+                        curses.color_pair(5) | DIM)
 
-        # drop_primary indicator
         if drop_primary:
             dp_str = "  drop_primary: ON"
             safe_addstr(stdscr, row, W - len(dp_str),
                         dp_str, BOLD | curses.color_pair(1))
         row += 2
 
-        # === Interfaces ===
+        # === Interfaces (from driver sysfs info — no iw needed) ===
         safe_addstr(stdscr, row, 2, "Interfaces", BOLD | curses.color_pair(4))
         row += 1
 
         if primary:
-            connected = pri_info.get("connected", False)
-            status = "CONNECTED" if connected else "DOWN"
-            sc = 2 if connected else 1
+            pri_connected = info.get("primary_connected", "0") == "1"
+            status = "CONNECTED" if pri_connected else "DOWN"
+            sc = 2 if pri_connected else 1
             safe_addstr(stdscr, row, 3, "PRIMARY", BOLD)
-            safe_addstr(stdscr, row, 12, primary)
+            safe_addstr(stdscr, row, 12, info.get("primary_iface", primary))
             safe_addstr(stdscr, row, 33, f"[{status}]",
                         curses.color_pair(sc))
-            if connected:
-                sig = pri_info.get("signal", "")
-                ssid = pri_info.get("ssid", "")
-                safe_addstr(stdscr, row, 45, f"{sig}  {ssid}")
+            if pri_connected:
+                rssi = info.get("primary_rssi", "?")
+                ssid = info.get("primary_ssid", "")
+                safe_addstr(stdscr, row, 45, f"{rssi} dBm  {ssid}")
             row += 1
 
         if helper:
-            htype = hlp_info.get("type", "?")
-            hch = hlp_info.get("channel", "?")
-            hcolor = 2 if htype == "monitor" and str(hch) == str(ch) else 3
+            hlp_ch = info.get("helper0_channel", "?")
+            bound_ch = info.get("channel", "?")
+            hcolor = 2 if hlp_ch == bound_ch else 3
+            # Check helper link state via interface flags (IFF_UP = 0x1)
+            hlp_flags_str = read_file(f"/sys/class/net/{helper}/flags")
+            if hlp_flags_str:
+                hlp_up = bool(int(hlp_flags_str, 16) & 0x1)
+            else:
+                hlp_up = False
+            hlp_state_str = "UP" if hlp_up else "DOWN"
+            hlp_state_color = 2 if hlp_up else 1
             safe_addstr(stdscr, row, 3, "HELPER", BOLD)
-            safe_addstr(stdscr, row, 12, helper)
-            safe_addstr(stdscr, row, 33, f"[{htype}]",
-                        curses.color_pair(hcolor))
-            safe_addstr(stdscr, row, 45, f"ch={hch}")
+            safe_addstr(stdscr, row, 12, info.get("helper0_iface", helper))
+            safe_addstr(stdscr, row, 33, f"[monitor {hlp_state_str}]",
+                        curses.color_pair(hlp_state_color))
+            safe_addstr(stdscr, row, 48, f"ch={hlp_ch}")
+            hlp_rssi = info.get("helper0_rssi", "0")
+            if hlp_rssi != "0" and hlp_rssi != "?":
+                safe_addstr(stdscr, row, 58, f"{hlp_rssi} dBm")
         elif stats.get("num_helpers", 0) > 0:
             safe_addstr(stdscr, row, 3, "HELPER", BOLD)
             safe_addstr(stdscr, row, 12, "(paired, interface not found)",
@@ -367,14 +422,12 @@ def draw(stdscr):
 
         # === Throughput ===
         safe_addstr(stdscr, row, 2, "Throughput", BOLD | curses.color_pair(4))
-        #                                       col 50 = rate column
         safe_addstr(stdscr, row, 50, "rate", DIM)
         safe_addstr(stdscr, row, 63, "total", DIM)
         row += 1
 
         if primary and primary in cur_net:
             rx_b = cur_net[primary]["rx_bytes"]
-            rx_p = cur_net[primary]["rx_packets"]
             rx_rate = rates.get(f"{primary}_rx_bps", 0)
             safe_addstr(stdscr, row, 3, "Primary stack RX")
             safe_addstr(stdscr, row, 46,
@@ -382,7 +435,6 @@ def draw(stdscr):
             safe_addstr(stdscr, row, 59,
                         f"{fmt_bytes(rx_b):>10s}")
             row += 1
-            # Explain the double-counting
             safe_addstr(stdscr, row, 3,
                         "(primary radio + helper injected frames)",
                         DIM | curses.color_pair(5))
@@ -403,6 +455,9 @@ def draw(stdscr):
         late = stats.get("helper_rx_late", 0)
         no_sta = stats.get("helper_rx_no_sta", 0)
         pool_full = stats.get("helper_rx_pool_full", 0)
+        deferred = stats.get("helper_rx_deferred", 0)
+        backpressure = stats.get("helper_rx_backpressure", 0)
+        pending = stats.get("pending_count", 0)
         matched = candidates - foreign
 
         def stat_line(label, value, rate_key, color=5, indent=3):
@@ -421,7 +476,6 @@ def draw(stdscr):
         stat_line("\u251c Foreign (wrong BSS/direction)",
                   foreign, "helper_rx_foreign")
 
-        # BSSID matched (computed, no own rate key — use candidates - foreign)
         matched_rate = rates.get("helper_rx_candidates", 0) - rates.get("helper_rx_foreign", 0)
         safe_addstr(stdscr, row, 3, f"{'\u251c BSSID matched':<34s}")
         safe_addstr(stdscr, row, 46,
@@ -430,7 +484,6 @@ def draw(stdscr):
         safe_addstr(stdscr, row, 59, f"{matched:>10,}")
         row += 1
 
-        # Sub-items under BSSID matched
         ac = 2 if accepted > 0 else 5
         safe_addstr(stdscr, row, 3, f"{'  \u251c Accepted (injected \u2192 stack)':<34s}")
         r_acc = rates.get("helper_rx_accepted", 0)
@@ -478,6 +531,35 @@ def draw(stdscr):
                     f"{pool_full + no_sta:>10,}", curses.color_pair(nc))
         row += 2
 
+        # === Deferred Queue ===
+        safe_addstr(stdscr, row, 2, "Deferred Queue",
+                    BOLD | curses.color_pair(4))
+        row += 1
+
+        pc = 2 if pending == 0 else (3 if pending < 64 else 1)
+        safe_addstr(stdscr, row, 3, f"{'Pending frames:':<24s}")
+        safe_addstr(stdscr, row, 27, f"{pending}",
+                    BOLD | curses.color_pair(pc))
+        row += 1
+
+        r_def = rates.get("helper_rx_deferred", 0)
+        safe_addstr(stdscr, row, 3, f"{'Deferred (enqueued):':<24s}")
+        safe_addstr(stdscr, row, 27, f"{deferred:,}")
+        if r_def:
+            safe_addstr(stdscr, row, 42, f"({fmt_pps(r_def)})",
+                        curses.color_pair(4))
+        row += 1
+
+        bpc = 2 if backpressure == 0 else 1
+        r_bp = rates.get("helper_rx_backpressure", 0)
+        safe_addstr(stdscr, row, 3, f"{'Backpressure drops:':<24s}")
+        safe_addstr(stdscr, row, 27, f"{backpressure:,}",
+                    curses.color_pair(bpc))
+        if r_bp:
+            safe_addstr(stdscr, row, 42, f"({fmt_pps(r_bp)})",
+                        curses.color_pair(1))
+        row += 2
+
         # === Diversity Metrics ===
         safe_addstr(stdscr, row, 2, "Diversity Metrics",
                     BOLD | curses.color_pair(4))
@@ -487,23 +569,38 @@ def draw(stdscr):
         if decided > 0:
             win_pct = accepted / decided * 100
             dup_pct = dup / decided * 100
-            # Color: green >50%, yellow 10-50%, red <10%
             wc = 2 if win_pct > 50 else (3 if win_pct > 10 else 1)
-            safe_addstr(stdscr, row, 3, "Helper win rate:")
+            safe_addstr(stdscr, row, 3, "Helper contribution:")
             safe_addstr(stdscr, row, 25,
                         f"{win_pct:5.1f}%",
                         BOLD | curses.color_pair(wc))
             safe_addstr(stdscr, row, 35,
-                        "(helper beats primary to stack)",
+                        f"novel  ({accepted:,} / {decided:,} frames)",
                         DIM)
             row += 1
 
             safe_addstr(stdscr, row, 3, "Dup overlap:")
             safe_addstr(stdscr, row, 25, f"{dup_pct:5.1f}%")
             safe_addstr(stdscr, row, 35,
-                        "(primary already had the frame)",
+                        f"redundant  (primary already had frame)",
                         DIM)
             row += 1
+
+            # Instantaneous contribution rate
+            r_acc = rates.get("helper_rx_accepted", 0)
+            r_dup = rates.get("helper_rx_dup_dropped", 0)
+            r_total = r_acc + r_dup
+            if r_total > 1:
+                inst_pct = r_acc / r_total * 100
+                ic = 2 if inst_pct > 50 else (3 if inst_pct > 10 else 1)
+                safe_addstr(stdscr, row, 3, "  (current rate:")
+                safe_addstr(stdscr, row, 19,
+                            f"{inst_pct:5.1f}%",
+                            curses.color_pair(ic))
+                safe_addstr(stdscr, row, 26,
+                            f"= {fmt_pps(r_acc)} novel / {fmt_pps(r_total)} decided)",
+                            DIM)
+                row += 1
         else:
             safe_addstr(stdscr, row, 3, "(no frames processed yet)", DIM)
             row += 1
@@ -537,7 +634,6 @@ def draw(stdscr):
                     curses.color_pair(5) | DIM)
         row += 1
 
-        # Flash message or default help
         if flash_msg and time.monotonic() < flash_until:
             safe_addstr(stdscr, row, 2, flash_msg,
                         BOLD | curses.color_pair(3))
@@ -555,6 +651,11 @@ def main():
     if os.geteuid() != 0:
         print("Must run as root (needs debugfs access)")
         sys.exit(1)
+
+    if "--status" in sys.argv or "-s" in sys.argv:
+        print_status()
+        return
+
     if not os.path.exists(STATS_PATH):
         print(f"Stats not found at {STATS_PATH}")
         print("Is the driver loaded with rtw_cooperative_rx=1?")

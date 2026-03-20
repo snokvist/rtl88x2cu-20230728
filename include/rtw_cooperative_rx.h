@@ -50,6 +50,8 @@ struct coop_rx_stats {
 	atomic_t helper_rx_crypto_err;	/* decryption failures */
 	atomic_t helper_rx_late;	/* too late for reorder window */
 	atomic_t helper_rx_no_sta;	/* sta_info not found */
+	atomic_t helper_rx_deferred;	/* frames enqueued to pending */
+	atomic_t helper_rx_backpressure;/* dropped: pending queue full */
 	atomic_t fallback_events;	/* helper disappeared/failed */
 	atomic_t pair_events;		/* successful pairings */
 	atomic_t unpair_events;		/* teardown events */
@@ -92,6 +94,13 @@ struct cooperative_rx_group {
 	/* Non-QoS dedup cache */
 	struct coop_nonqos_seq_cache nonqos_cache;
 
+	/* Deferred processing: helper enqueues, drain tasklet processes */
+	_queue pending_queue;		/* validated frames awaiting processing */
+	_tasklet coop_rx_tasklet;	/* drains pending_queue */
+	atomic_t pending_count;		/* backpressure gauge */
+#define COOP_PENDING_MAX	128	/* drop threshold */
+#define COOP_BATCH_SIZE		32	/* frames per tasklet run */
+
 	/* Statistics */
 	struct coop_rx_stats stats;
 
@@ -117,6 +126,9 @@ int rtw_coop_rx_bind_session(_adapter *primary);
 void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
+
+/* Drain tasklet for deferred helper frame processing */
+void rtw_coop_rx_drain_tasklet(unsigned long data);
 
 /* Helper RX hot path — single entry point for pre_recv_entry() hook */
 int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,
