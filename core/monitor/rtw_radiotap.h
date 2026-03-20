@@ -21,6 +21,7 @@ struct mon_reg_backup {
 	u8	known_drvinfo:1;
 	u8	known_rxfilter:1;
 	u8	known_misc0:1;
+	u8	is_monitor:1;
 	/* data */
 	u8	drvinfo;
 	u16	rxfilter0;
