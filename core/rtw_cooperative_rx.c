@@ -35,6 +35,28 @@
 /* Module parameter — 0=disabled (default), 1=enabled */
 int rtw_cooperative_rx = 0;
 
+/*
+ * Reset all stats counters using atomic_set() — safe for atomic_t fields.
+ * Never use memset() on struct coop_rx_stats: atomic_t may have internal
+ * state beyond a simple integer on some kernel configs (DEBUG_ATOMIC_SLEEP).
+ */
+static void coop_rx_stats_reset(struct coop_rx_stats *stats)
+{
+	atomic_set(&stats->helper_rx_candidates, 0);
+	atomic_set(&stats->helper_rx_accepted, 0);
+	atomic_set(&stats->helper_rx_dup_dropped, 0);
+	atomic_set(&stats->helper_rx_pool_full, 0);
+	atomic_set(&stats->helper_rx_foreign, 0);
+	atomic_set(&stats->helper_rx_crypto_err, 0);
+	atomic_set(&stats->helper_rx_late, 0);
+	atomic_set(&stats->helper_rx_no_sta, 0);
+	atomic_set(&stats->helper_rx_deferred, 0);
+	atomic_set(&stats->helper_rx_backpressure, 0);
+	atomic_set(&stats->fallback_events, 0);
+	atomic_set(&stats->pair_events, 0);
+	atomic_set(&stats->unpair_events, 0);
+}
+
 /* Debug: drop all primary RX data frames to test helper-only path */
 int rtw_coop_rx_drop_primary = 0;
 
@@ -64,7 +86,7 @@ int rtw_coop_rx_init(void)
 	grp->state = COOP_STATE_IDLE;
 	grp->primary = NULL;
 	grp->num_helpers = 0;
-	memset(&grp->stats, 0, sizeof(grp->stats));
+	coop_rx_stats_reset(&grp->stats);
 
 	/* Init deferred processing queue and tasklet */
 	_rtw_init_queue(&grp->pending_queue);
@@ -481,9 +503,20 @@ void rtw_coop_rx_notify_channel_switch(_adapter *adapter)
 		 "moving helpers\n", __func__, old_ch, new_ch, new_bw);
 
 	for (i = 0; i < snap_count; i++) {
-		if (helper_snap[i])
-			set_channel_bwmode(helper_snap[i], new_ch,
-					   new_offset, new_bw);
+		if (!helper_snap[i])
+			continue;
+		/* Skip helpers whose netdev is down — set_channel_bwmode
+		 * on a dead interface is a no-op at best, and the helper
+		 * will need full re-init to recover anyway. */
+		if (helper_snap[i]->pnetdev &&
+		    !(helper_snap[i]->pnetdev->flags & IFF_UP)) {
+			RTW_WARN("%s: helper iface_id=%d is DOWN, "
+				 "skipping channel move\n",
+				 __func__, helper_snap[i]->iface_id);
+			continue;
+		}
+		set_channel_bwmode(helper_snap[i], new_ch,
+				   new_offset, new_bw);
 	}
 }
 
@@ -536,6 +569,9 @@ static bool coop_nonqos_is_dup(struct cooperative_rx_group *grp, u16 seq_num)
 {
 	struct coop_nonqos_seq_cache *cache = &grp->nonqos_cache;
 	int i;
+
+	/* valid bitmask is u32 — cache size must not exceed 32 slots */
+	BUILD_BUG_ON(COOP_NONQOS_SEQ_CACHE_SZ > 32);
 
 	for (i = 0; i < COOP_NONQOS_SEQ_CACHE_SZ; i++) {
 		if (cache->valid & BIT(i) && cache->seqs[i] == seq_num)
@@ -962,6 +998,10 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 		struct rx_pkt_attrib *pa;
 		struct sta_info *psta;
 
+		/* Dequeue from pending_queue. rtw_alloc_recvframe() is the
+		 * driver's standard queue-head dequeue; despite its name
+		 * (designed for free-pool allocation), it works on any
+		 * _queue and is used here intentionally. */
 		pframe = rtw_alloc_recvframe(&grp->pending_queue);
 		if (!pframe)
 			break;
@@ -1017,7 +1057,17 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			}
 
 			/* Claim this frame — primary's recv_decache
-			 * will see our write and drop its copy */
+			 * will see our write and drop its copy.
+			 *
+			 * Race note: there is a narrow window where both
+			 * the primary's recv_decache and this tasklet read
+			 * the old *prxseq, both pass, and both deliver.
+			 * This mirrors the driver's own recv_decache which
+			 * is also non-atomic (read-then-write without lock).
+			 * For encrypted frames, CCMP PN replay check
+			 * provides a second dedup layer. For non-QoS
+			 * unencrypted frames, higher-layer dedup (IP/TCP)
+			 * handles the rare duplicate. */
 			WRITE_ONCE(*prxseq, seq_ctrl);
 		}
 
@@ -1077,14 +1127,30 @@ static ssize_t coop_rx_store_enabled(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
 {
+	struct net_device *ndev = to_net_dev(dev);
+	_adapter *adapter = rtw_netdev_priv(ndev);
+	struct cooperative_rx_group *grp;
 	int val;
 
 	if (kstrtoint(buf, 10, &val))
 		return -EINVAL;
 
-	if (val == 0 && rtw_coop_rx_group) {
+	grp = READ_ONCE(rtw_coop_rx_group);
+	if (!grp)
+		return -ENODEV;
+
+	if (val == 0) {
 		rtw_coop_rx_unbind_session();
 		RTW_INFO("coop_rx: disabled via sysfs\n");
+	} else if (val == 1 && grp->primary == adapter &&
+		   grp->state == COOP_STATE_IDLE) {
+		/* Re-enable: rebind session if primary is associated */
+		int ret = rtw_coop_rx_bind_session(adapter);
+
+		if (ret)
+			RTW_WARN("coop_rx: re-enable failed (%d)\n", ret);
+		else
+			RTW_INFO("coop_rx: re-enabled via sysfs\n");
 	}
 
 	return count;
@@ -1266,7 +1332,7 @@ static ssize_t coop_rx_store_reset_stats(struct device *dev,
 	if (!grp)
 		return -ENODEV;
 
-	memset(&grp->stats, 0, sizeof(grp->stats));
+	coop_rx_stats_reset(&grp->stats);
 	RTW_INFO("coop_rx: stats reset\n");
 	return count;
 }
@@ -1381,13 +1447,17 @@ static ssize_t coop_rx_show_info(struct device *dev,
 		if (!hlp)
 			continue;
 
+		/* Use dvobj->oper_channel for actual HW channel:
+		 * mlmeextpriv.cur_channel isn't updated for monitor-mode
+		 * adapters, but set_channel_bwmode() updates oper_channel
+		 * via rtw_set_oper_ch(). */
 		len += scnprintf(buf + len, PAGE_SIZE - len,
 			"helper%d_iface=%s\n"
 			"helper%d_channel=%u\n"
 			"helper%d_rssi=%d\n"
 			"helper%d_signal=%u\n",
 			i, hlp->pnetdev ? hlp->pnetdev->name : "?",
-			i, grp->bound_channel,  /* helper tunes to bound ch */
+			i, adapter_to_dvobj(hlp)->oper_channel,
 			i, hlp->recvpriv.rssi,
 			i, hlp->recvpriv.signal_strength);
 	}

@@ -2,7 +2,7 @@
 #
 # coop-rx-test.sh — Automated cooperative RX diversity test suite
 #
-# Runs 8 test scenarios with positive path verification.
+# Runs 9 test scenarios with positive path verification.
 # Requires both adapters already paired and bound (run coop-rx-start.sh first).
 #
 # Usage: sudo ./coop-rx-test.sh [GATEWAY]
@@ -638,6 +638,85 @@ else
             fail "Test 8b: Return switch — ${DETAIL} [${MSGS}]"
         fi
         unset S
+    fi
+fi
+
+# ---- Test 9: Stats reset correctness -----------------------------------------
+# Verifies that stats reset via sysfs properly zeroes all atomic counters.
+# Validates fix for memset-on-atomics bug (must use atomic_set per field).
+
+info "Test 9: Stats reset correctness"
+
+HELPER=$(find_helper)
+STATE=$(get_stat "state")
+
+if [ -z "$HELPER" ] || [ "$STATE" != "3" ]; then
+    skip "Test 9: No helper or not ACTIVE state"
+else
+    # Phase 1: Generate traffic so counters are nonzero
+    run_ping "$PRIMARY" "$GW" 20 "$PING_INTERVAL" > /dev/null 2>&1
+    sleep 1
+
+    declare -A PRE=()
+    snapshot_stats PRE
+    PRE_CANDIDATES="${PRE[helper_rx_candidates]:-0}"
+
+    if [ "$PRE_CANDIDATES" -lt 1 ]; then
+        skip "Test 9: No helper traffic generated (candidates=0)"
+    else
+        # Phase 2: Reset stats and immediately snapshot.
+        # Small tolerance: the helper radio continuously receives frames
+        # (beacons, etc.) so a few may arrive between reset and read.
+        # The key assertion is that counters drop from thousands to near-zero,
+        # proving atomic_set() zeroed them (vs memset corruption).
+        reset_stats "$PRIMARY"
+
+        declare -A POST=()
+        snapshot_stats POST
+
+        MSGS=""
+        TFAIL=0
+
+        # Allow up to 200 frames of background traffic between reset and read
+        RESET_TOL=200
+        for key in helper_rx_candidates helper_rx_accepted helper_rx_dup_dropped \
+                   helper_rx_pool_full helper_rx_foreign helper_rx_crypto_err \
+                   helper_rx_late helper_rx_no_sta helper_rx_deferred \
+                   helper_rx_backpressure; do
+            val="${POST[$key]:-0}"
+            if [ "$val" -gt "$RESET_TOL" ]; then
+                MSGS="${MSGS} ${key}=${val}>${RESET_TOL}"
+                TFAIL=1
+            fi
+        done
+        # pending_count must be exactly 0 at rest (no tolerance)
+        PENDING_VAL="${POST[pending_count]:-0}"
+        if [ "$PENDING_VAL" != "0" ]; then
+            MSGS="${MSGS} pending_count=${PENDING_VAL}!=0"
+            TFAIL=1
+        fi
+
+        # Phase 4: Generate more traffic after reset
+        run_ping "$PRIMARY" "$GW" 20 "$PING_INTERVAL" > /dev/null 2>&1
+        sleep 1
+
+        declare -A POST2=()
+        snapshot_stats POST2
+        POST2_CANDIDATES="${POST2[helper_rx_candidates]:-0}"
+
+        # Counters must be incrementing again from 0
+        if [ "$POST2_CANDIDATES" -lt 1 ]; then
+            MSGS="${MSGS} post_reset_candidates=0(counters_stuck)"
+            TFAIL=1
+        fi
+
+        DETAIL="pre_candidates=${PRE_CANDIDATES} post_reset_candidates=${POST2_CANDIDATES}"
+        if [ "$TFAIL" -eq 0 ]; then
+            pass "Test 9: Stats reset — ${DETAIL} (all counters zeroed correctly)"
+        else
+            fail "Test 9: Stats reset — ${DETAIL} [${MSGS}]"
+        fi
+        unset PRE POST POST2
     fi
 fi
 

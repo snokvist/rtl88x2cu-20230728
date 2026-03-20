@@ -959,8 +959,12 @@ u8 adapter_allow_bmc_data_rx(_adapter *adapter);
 s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status);
 void count_rx_stats(_adapter *padapter, union recv_frame *prframe, struct sta_info *sta);
 
-/* PN replay check — used by cooperative RX pre-decrypt filter */
-#define PN_LESS_CHK(a, b)	(((a-b) & 0x800000000000ULL) != 0)
+/* PN replay check — used by cooperative RX pre-decrypt filter.
+ * CCMP/GCMP PNs are 48 bits; mask both operands to prevent
+ * upper bits (from RTW_GET_LE64 on an 8-byte array) from
+ * corrupting the modular arithmetic sign check. */
+#define PN_48_MASK		0xFFFFFFFFFFFFULL
+#define PN_LESS_CHK(a, b)	((((((a) & PN_48_MASK) - ((b) & PN_48_MASK))) & 0x800000000000ULL) != 0)
 #define VALID_PN_CHK(new, old)	(((old) == 0) || PN_LESS_CHK(old, new))
 
 /* Exposed for cooperative RX merge path */
