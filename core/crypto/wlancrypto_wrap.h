@@ -31,4 +31,10 @@ u8* gcmp_encrypt(_adapter *padapter, const u8 *tk, size_t tk_len, const u8 *fram
 	size_t hdrlen, const u8 *qos,
 	const u8 *pn, int keyid, size_t *encrypted_len);
 
+/* AAD/nonce construction — exported for kernel crypto path in coop RX */
+void ccmp_aad_nonce(_adapter *padapter, const struct ieee80211_hdr *hdr,
+	const u8 *data, u8 *aad, size_t *aad_len, u8 *nonce);
+void gcmp_aad_nonce(_adapter *padapter, const struct ieee80211_hdr *hdr,
+	const u8 *data, u8 *aad, size_t *aad_len, u8 *nonce);
+
 #endif /* WLANCRYPTO_WRAP_H */

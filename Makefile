@@ -2636,6 +2636,13 @@ rtk_core += core/rtw_sdio.o
 endif
 
 EXTRA_CFLAGS += -I$(src)/core/crypto
+
+# Cooperative RX: use kernel crypto API for HW-accelerated decrypt
+# (ARM64 CE, x86 AES-NI, etc). Disable with CONFIG_COOP_RX_KERNEL_CRYPTO=n
+CONFIG_COOP_RX_KERNEL_CRYPTO ?= y
+ifeq ($(CONFIG_COOP_RX_KERNEL_CRYPTO), y)
+EXTRA_CFLAGS += -DCONFIG_COOP_RX_KERNEL_CRYPTO
+endif
 rtk_core += \
 		core/crypto/aes-internal.o \
 		core/crypto/aes-internal-enc.o \
