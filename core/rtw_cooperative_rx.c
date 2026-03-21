@@ -8,12 +8,14 @@
  * adapter's RX path, improving robustness under fading/interference.
  *
  * Architecture:
- *   - Primary adapter operates normally in STA mode
- *   - Helper adapter(s) in monitor mode on the same channel/BSSID
+ *   - Primary adapter operates normally in STA or AP mode
+ *   - Helper adapter(s) in monitor mode on the same channel
  *   - Helper RX frames are SW-decrypted and injected into primary's
  *     recv_func_posthandle() (decrypt → defrag → reorder)
  *   - CCMP PN replay check + reorder window provide duplicate suppression
  *   - One coherent RX stream is delivered to the network stack
+ *   - STA mode: captures AP→STA downlink (to_fr_ds=2)
+ *   - AP mode: captures STA→AP uplink (to_fr_ds=1)
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of version 2 of the GNU General Public License as
@@ -497,16 +499,13 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	u8 bw = CHANNEL_WIDTH_20;
 	u8 offset = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
 
-	/* Cycle the netdev DOWN→UP to detach wpa_supplicant/NM and
-	 * clear any stale STA state.  dev_close() triggers cfg80211
-	 * cleanup; we then reconfigure as monitor before dev_open(). */
-	if (ndev->flags & IFF_UP)
-		dev_close(ndev);
-
 	/* Set netdev type for radiotap headers */
 	ndev->type = ARPHRD_IEEE80211_RADIOTAP;
 
-	/* Update cfg80211 wdev type so iw/NM report "monitor" correctly */
+	/* Update cfg80211 wdev type so iw/NM report "monitor" correctly.
+	 * Note: on systems with NetworkManager, userspace should run
+	 * `nmcli dev set <helper> managed no` before binding to prevent
+	 * NM from interfering. The coop-rx-start.sh script handles this. */
 	if (helper->rtw_wdev)
 		helper->rtw_wdev->iftype = NL80211_IFTYPE_MONITOR;
 
@@ -515,8 +514,12 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	rtw_set_802_11_infrastructure_mode(helper, Ndis802_11Monitor, 0);
 	rtw_setopmode_cmd(helper, Ndis802_11Monitor, RTW_CMDF_WAIT_ACK);
 
-	/* Bring interface back up in monitor mode */
-	dev_open(ndev, NULL);
+#ifdef CONFIG_RTW_ACS
+	/* Disable ACS on the helper — ACS channel scanning would pull
+	 * the helper off its bound channel, breaking cooperative RX. */
+	helper->registrypriv.acs_mode = 0;
+	rtw_acs_stop(helper);
+#endif
 
 	/* Match primary's bandwidth so helper receives all sub-carriers */
 	if (grp && grp->primary) {
@@ -525,12 +528,6 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	}
 
 	set_channel_bwmode(helper, channel, offset, bw);
-
-#ifdef CONFIG_RTW_ACS
-	/* Disable ACS on the helper — ACS channel scanning would pull
-	 * the helper off its bound channel, breaking cooperative RX. */
-	rtw_acs_stop(helper);
-#endif
 
 	RTW_INFO("%s: helper iface_id=%d set to monitor mode ch=%u bw=%u\n",
 		 __func__, helper->iface_id, channel, bw);
@@ -1221,12 +1218,16 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
  * ============================================================
  *
  * Provides /sys/class/net/wlanX/coop_rx/ directory with:
- *   enabled    - read/write 0/1
- *   role       - read: "primary", "helper", "none"
- *   stats      - read: statistics counters
- *   pair       - write: interface name to pair as helper
- *   unpair     - write: interface name to unpair
- *   bind       - write: 1 to bind session (after association)
+ *   enabled       - read/write 0/1
+ *   role          - read: "primary", "helper", "none"
+ *   stats         - read: statistics counters
+ *   info          - read: machine-parseable setup summary (key=value)
+ *   pair          - write: interface name to pair as helper
+ *   unpair        - write: interface name to unpair
+ *   auto_pair     - write: 1 to set primary and auto-discover helpers
+ *   bind          - write: 1 to bind session (after association)
+ *   reset_stats   - write: 1 to zero all counters
+ *   drop_primary  - read/write: debug flag to drop primary RX data
  */
 
 static ssize_t coop_rx_show_enabled(struct device *dev,

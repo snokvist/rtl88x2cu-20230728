@@ -84,7 +84,7 @@ struct cooperative_rx_group {
 	spinlock_t lock;
 	enum coop_rx_state state;
 
-	/* Primary adapter — the one with active STA connection */
+	/* Primary adapter — the one with active STA or AP connection */
 	_adapter *primary;
 	struct dvobj_priv *primary_dvobj;
 
@@ -94,7 +94,7 @@ struct cooperative_rx_group {
 	int num_helpers;
 
 	/* Session binding — which BSS we're filtering for */
-	u8 bound_bssid[ETH_ALEN];	/* BSSID = AP MAC (TA) in infra BSS */
+	u8 bound_bssid[ETH_ALEN];	/* STA: AP MAC, AP: own MAC */
 	u8 bound_channel;
 	u8 bound_bw;
 

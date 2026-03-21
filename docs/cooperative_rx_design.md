@@ -205,10 +205,14 @@ struct cooperative_rx_group {
         atomic_t helper_rx_accepted;     /* frames injected */
         atomic_t helper_rx_dup_dropped;  /* duplicates caught */
         atomic_t helper_rx_pool_full;    /* primary pool exhausted */
-        atomic_t helper_rx_foreign;      /* wrong BSSID/TA */
+        atomic_t helper_rx_foreign;      /* wrong BSSID/TA/direction */
         atomic_t helper_rx_crypto_err;   /* decrypt failures */
         atomic_t helper_rx_late;         /* too late for reorder */
         atomic_t helper_rx_no_sta;       /* sta_info not found */
+        atomic_t helper_rx_deferred;     /* enqueued to pending */
+        atomic_t helper_rx_backpressure; /* dropped: queue full */
+        atomic_t helper_rx_rssi_better;  /* helper RSSI > primary avg */
+        atomic_t helper_rx_rssi_worse;   /* helper RSSI <= primary avg */
         atomic_t fallback_events;        /* helper disappeared */
         atomic_t pair_events;            /* successful pairings */
         atomic_t unpair_events;          /* teardown events */
@@ -263,8 +267,11 @@ TEARDOWN: Helper unplugged or feature disabled, draining queues.
 
 For non-QoS frames that don't go through the reorder window:
 - Maintain a small cooperative seq_num cache (last N accepted seq_nums)
-- Helper frame accepted only if its seq_num is NOT in the cache
-- This prevents duplicate delivery for non-AMPDU traffic
+- Each cache entry stores both seq_num and TA (transmitter address), so
+  different STAs using the same sequence number are not false-positive dups
+- Helper frame accepted only if its (seq_num, TA) pair is NOT in the cache
+- This prevents duplicate delivery for non-AMPDU traffic and is essential
+  for AP mode where multiple STAs may use the same sequence numbers
 
 ### 3. Safety Contract (Phase 1)
 
@@ -273,20 +280,20 @@ For non-QoS frames that don't go through the reorder window:
 1. When `rtw_cooperative_rx=0` (default): **ZERO code path changes**.
    All cooperative code is behind runtime checks.
 2. Primary adapter appears as ordinary wlan interface.
-3. Helper adapter's netdev is DOWN and not independently usable while
-   slaved.
+3. Helper adapter's netdev is cycled DOWN→UP into monitor mode during
+   bind. The driver detaches wpa_supplicant/NM, disables ACS, and
+   blocks cfg80211 scan requests on the helper.
 4. Helper failure → graceful fallback to primary-only with log message.
 5. No deadlock on USB disconnect/reset/suspend of either adapter.
-6. AP/client mode compatibility preserved (first implementation: STA only).
+6. Both STA and AP mode supported as primary. STA mode captures AP→STA
+   downlink (to_fr_ds=2). AP mode captures STA→AP uplink (to_fr_ds=1).
 
-#### 3.2 Non-Goals (First Implementation)
+#### 3.2 Non-Goals
 
 - No throughput bonding / bandwidth aggregation
-- No AP mode cooperative RX (STA only first)
 - No multi-channel operation
 - No cross-BSSID roaming assistance
-- No helper TX capability
-- No automatic adapter discovery (manual pairing via sysfs/debugfs)
+- No helper TX capability (see roadmap for TX diversity)
 
 #### 3.3 Kill Switches
 
@@ -427,9 +434,13 @@ This is a significant engineering effort and is not planned.
 | Hook | File | What to add |
 |---|---|---|
 | RX intercept | `core/rtw_recv.c` in `pre_recv_entry()` | `if (rtw_coop_rx_pre_recv_entry(...) == RTW_RX_HANDLED) goto exit;` before monitor mode check |
-| CSA follow | `core/rtw_cmd.c` in `rtw_dfs_ch_switch_hdl()` | `rtw_coop_rx_notify_channel_switch(pri_adapter);` after `set_channel_bwmode` + `#include <rtw_cooperative_rx.h>` |
+| drop_primary guard | `core/rtw_recv.c` in `pre_recv_entry()` | Guard `rtw_coop_rx_drop_primary` with `rtw_coop_rx_active() && !rtw_coop_rx_is_helper()` |
+| Scan block | `os_dep/linux/ioctl_cfg80211.c` in `cfg80211_rtw_scan()` | `if (rtw_coop_rx_is_helper(padapter)) { indicate_scan_done; goto exit; }` |
+| CSA follow | `core/rtw_cmd.c` in `rtw_dfs_ch_switch_hdl()` | `rtw_coop_rx_notify_channel_switch(pri_adapter);` after `set_channel_bwmode` |
 | Channel set | `core/rtw_mlme_ext.c` in `set_ch_hdl()` | `rtw_coop_rx_notify_channel_switch(padapter);` after channel update |
 | Init/deinit | `os_dep/linux/usb_intf.c` | `rtw_coop_rx_init()` before `usb_register()`, `rtw_coop_rx_deinit()` in exit + error path |
+| USB remove | `os_dep/linux/usb_intf.c` in `rtw_dev_remove()` | `rtw_coop_rx_remove_adapter(padapter);` before teardown |
+| Module params | `os_dep/linux/os_intfs.c` | `module_param` for `rtw_cooperative_rx` and `rtw_coop_rx_drop_primary` |
 | Export ops | `os_dep/linux/os_intfs.c` | Remove `static` from `rtw_netdev_ops` |
 | Header decls | `include/rtw_recv.h` | Add `recv_func_posthandle()` extern + PN macros |
 | Makefile | `Makefile` | Add `core/rtw_cooperative_rx.o` to `rtk_core` |
