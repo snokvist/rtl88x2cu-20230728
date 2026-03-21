@@ -499,6 +499,13 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	u8 bw = CHANNEL_WIDTH_20;
 	u8 offset = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
 
+#ifdef CONFIG_RTW_ACS
+	/* Disable ACS BEFORE bringing the interface up — ndo_open calls
+	 * rtw_acs_start() when acs_mode is set. Clear it first so ACS
+	 * never activates on the helper. */
+	helper->registrypriv.acs_mode = 0;
+#endif
+
 	/* Ensure the interface is UP — the driver's ndo_open handler
 	 * initializes USB URBs and hardware state. Without this, the
 	 * radio doesn't receive any frames. Safe to call if already UP. */
@@ -524,9 +531,6 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	rtw_setopmode_cmd(helper, Ndis802_11Monitor, RTW_CMDF_WAIT_ACK);
 
 #ifdef CONFIG_RTW_ACS
-	/* Disable ACS on the helper — ACS channel scanning would pull
-	 * the helper off its bound channel, breaking cooperative RX. */
-	helper->registrypriv.acs_mode = 0;
 	rtw_acs_stop(helper);
 #endif
 

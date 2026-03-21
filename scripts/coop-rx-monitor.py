@@ -169,7 +169,8 @@ def print_status():
     hlp_rssi = info.get("helper0_rssi", "?")
     hlp_signal = info.get("helper0_signal", "?")
 
-    print(f"=== Cooperative RX Diversity ===")
+    pri_mode = info.get("primary_mode", "STA")
+    print(f"=== Cooperative RX Diversity ({pri_mode} mode) ===")
     pri_ch_tag = ""
     if pri_ch != channel:
         pri_ch_tag = f"  (pri: {pri_ch}) MISMATCH"
@@ -220,12 +221,17 @@ def print_status():
         decided = accepted + dup
         contrib = (accepted / decided * 100) if decided > 0 else 0
 
+        rssi_better = stats.get("helper_rx_rssi_better", 0)
+        rssi_worse = stats.get("helper_rx_rssi_worse", 0)
+
         print(f"  Candidates:  {candidates:>8,}  (foreign: {foreign:,})")
         print(f"  Accepted:    {accepted:>8,}")
         print(f"  Dup dropped: {dup:>8,}")
         print(f"  Late:        {late:>8,}")
         print(f"  Crypto err:  {crypto:>8,}")
         print(f"  Deferred:    {deferred:>8,}  pending: {pending}  backpressure: {backpressure}")
+        if accepted > 0:
+            print(f"  RSSI:        better={rssi_better:,}  worse={rssi_worse:,}")
         if decided > 0:
             print(f"  Helper contribution: {contrib:.1f}%  ({accepted:,} / {decided:,} decided)")
 

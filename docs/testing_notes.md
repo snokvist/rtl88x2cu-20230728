@@ -1,33 +1,38 @@
-# Cooperative RX Testing Notes — 2026-03-19
+# Cooperative RX Testing Notes — 2026-03-21
 
 ## What WORKS
 
 1. **Driver compiles cleanly** with cooperative RX code — no warnings
 2. **Module loads** with `rtw_cooperative_rx=1` — parameter visible at `/sys/module/88x2cu/parameters/`
-3. **sysfs** `coop_rx/` directory appears on all interfaces with 6 attributes
+3. **sysfs** `coop_rx/` directory appears on all interfaces with 10 attributes
+   (`enabled`, `role`, `stats`, `info`, `pair`, `unpair`, `auto_pair`, `bind`,
+   `reset_stats`, `drop_primary`)
 4. **debugfs** at `/sys/kernel/debug/rtw_coop_rx/stats` works correctly
 5. **Pairing** primary/helper via sysfs works — state transitions correctly
-6. **Binding** session to active BSS works — captures BSSID, channel, BW
-7. **Single adapter connects fine** to `waybeam-03` (WPA2-PSK CCMP, ch157 5GHz)
-8. **DHCP works** — gets 10.6.0.x from AP, pings 10.6.0.1 fine
-9. **USB unbind/rebind** works as software unplug/replug to avoid auth interference
-10. **Safe startup script** — unload driver BEFORE USB unbind prevents PC hangs
-11. **coop-rx-start.sh** runs end-to-end with continuous helper RX (~1000 frames/sec)
-12. **coop-rx-monitor.py** ncurses dashboard parses and displays all stats correctly
-13. **Helper in monitor mode** — driver-internal monitor mode via
-    `rtw_coop_rx_enable_helper_monitor()` works correctly, cfg80211 reports
-    `monitor` type, helper receives continuously on bound channel
-14. **Recv frame pool isolation** — helper frames are transferred to primary-
-    allocated recv_frames before injection, preventing pool drain
-
-15. **SW decryption of helper frames** — helper frames on WPA2 networks are
-    SW-decrypted using the primary's pairwise key via `recv_func_posthandle()`.
-    CCMP PN replay check provides natural duplicate suppression for in-window
-    frames. Verified: crypto_err=0, dup_dropped growing (PN replay on
-    duplicates), ping 0% loss with cooperative RX active on WPA2-PSK CCMP.
-16. **Sysfs input validation** — writing non-RTW interface names (e.g. `eno1`,
-    `lo`) to `coop_rx_pair` returns `-EINVAL`. Prevents memory corruption
-    from calling `rtw_netdev_priv()` on foreign net_devices.
+6. **Auto-pair** via `coop_rx_auto_pair` discovers helpers automatically
+7. **Binding** session to active BSS works — captures BSSID, channel, BW
+8. **STA mode** — 10/10 test scenarios pass (baseline, diversity, helper-only,
+   primary-only, unpair mid-stream, re-pair, stats consistency, CSA channel
+   switch forward+return, stats reset)
+9. **AP mode** — 6/6 test scenarios pass (binding with own MAC as BSSID,
+   remote STA association, uplink cooperative RX, helper-only AP mode,
+   stats consistency, bidirectional traffic). Per-STA crypto key lookup
+   verified with zero crypto/no_sta errors.
+10. **SW decryption** — helper frames on WPA2 are SW-decrypted using primary's
+    pairwise key via `recv_func_posthandle()`. CCMP PN replay check provides
+    natural duplicate suppression.
+11. **Helper monitor mode** — `enable_helper_monitor()` brings interface UP,
+    sets radiotap type, configures WIFI_MONITOR_STATE, disables ACS, blocks
+    cfg80211 scans. Helper stays locked on bound channel.
+12. **Channel switch (CSA)** — helpers follow primary to new channel
+    automatically via `rtw_coop_rx_notify_channel_switch()`
+13. **Recv frame pool isolation** — helper frames transferred to primary pool
+14. **Per-STA non-QoS dedup** — cache entries keyed on (seq, TA), prevents
+    false dups from different STAs in AP mode
+15. **RSSI observability** — `helper_rx_rssi_better/worse` counters track
+    signal quality comparison between helper and primary
+16. **Sysfs input validation** — non-RTW interface names rejected
+17. **Namespace-aware** — sysfs pair/unpair use `rtw_get_same_net_ndev_by_name()`
 
 ## What WAS FIXED (2026-03-19)
 
@@ -107,6 +112,10 @@ All counters are atomic and visible via:
 | `helper_rx_late` | QoS/AMPDU frames where the sequence number is behind the primary's reorder window start (`indicate_seq`). The primary has already moved past this point in the stream — the helper's copy arrived too late to be useful. A high late count relative to candidates suggests the helper has higher latency than the primary (longer USB path, slower processing). |
 | `helper_rx_crypto_err` | Frames with CRC/ICV errors, or frames where the encryption algorithm couldn't be determined (primary has no keys). Should be 0 during normal WPA2 operation — SW decryption handles encrypted helper frames via `recv_func_posthandle()`. Non-zero indicates the primary isn't associated or has no pairwise key. |
 | `helper_rx_no_sta` | Frames where the transmitter address couldn't be found in the primary's station table (`sta_info`). This shouldn't happen during normal operation — if it does, the primary may have disassociated or the AP changed its MAC. |
+| `helper_rx_deferred` | Frames enqueued to the pending queue for processing by the drain tasklet. Should track close to `accepted` — the difference is frames dropped by the drain tasklet's dedup check. |
+| `helper_rx_backpressure` | Frames dropped because the pending queue exceeded `COOP_PENDING_MAX` (128). Indicates the drain tasklet can't keep up. Should be 0 under normal load. |
+| `helper_rx_rssi_better` | Accepted helper frames where the helper's `recv_signal_power` exceeded the primary's running RSSI average. Pure observability — does not affect frame acceptance (first-wins). |
+| `helper_rx_rssi_worse` | Accepted helper frames where the helper's RSSI was equal to or below the primary's average. |
 
 ### System event counters
 
@@ -164,21 +173,21 @@ Stats are aggregated across all helpers (not per-helper).
 ## Architecture
 
 ```
-Primary adapter (managed mode, associated to AP)
+Primary adapter (STA or AP mode)
   └─ Normal RX path → network stack
   └─ Cooperative RX: helper frames SW-decrypted and injected via
      recv_func_posthandle() (decrypt → defrag → portctrl → reorder)
+  └─ STA mode: captures AP→STA downlink (to_fr_ds=2)
+  └─ AP mode: captures STA→AP uplink (to_fr_ds=1), per-STA key lookup
 
 Helper adapter (monitor mode via driver internal API)
-  └─ WIFI_MONITOR_STATE set by rtw_coop_rx_enable_helper_monitor()
-  └─ cfg80211 wdev iftype set to NL80211_IFTYPE_MONITOR
-  └─ Channel parked via set_channel_bwmode()
-  └─ RCR set to promiscuous (BIT_AAP), filter maps 0xFFFF
+  └─ enable_helper_monitor(): dev_open (if DOWN) → radiotap type →
+     WIFI_MONITOR_STATE → ACS disable → scan block → set_channel_bwmode
   └─ pre_recv_entry() hook intercepts data frames
-  └─ Validates: BSSID match, TA match, RA match
+  └─ Validates: direction, BSSID, TA/RA (mode-aware)
   └─ Fixes up encrypt/iv_len/icv_len from primary's security context
   └─ Allocates primary recv_frame, transfers skb, frees helper frame
-  └─ Injects into recv_func_posthandle() for SW decrypt + reorder
+  └─ Enqueues to pending_queue → drain tasklet processes deferred
   └─ CCMP PN replay check provides natural duplicate suppression
 ```
 
@@ -186,9 +195,13 @@ Helper adapter (monitor mode via driver internal API)
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/coop-rx-start.sh` | Full setup: unload, USB unbind, load, connect, rebind, NM restart, pair, bind |
+| `scripts/coop-rx-start.sh` | STA mode setup: unload, USB unbind, load, connect, rebind, NM restart, pair, bind |
 | `scripts/coop-rx-stop.sh` | Tear down: kill wpa_supplicant, print final stats |
-| `scripts/coop-rx-monitor.py` | Live ncurses dashboard: stats, rates, interface status |
+| `scripts/coop-rx-test.sh` | STA mode test suite: 10 scenarios including CSA channel switch |
+| `scripts/coop-rx-monitor.py` | Live ncurses dashboard: stats, rates, AP/STA mode display |
+| `scripts/coop-rx-ap-test-start.sh` | AP mode setup: hostapd on primary, remote STA via SSH |
+| `scripts/coop-rx-ap-test-verify.sh` | AP mode test suite: 6 scenarios |
+| `scripts/coop-rx-ap-test-stop.sh` | AP mode teardown: stop hostapd, restore remote AP |
 
 ## Hardware
 
