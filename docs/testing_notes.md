@@ -18,21 +18,25 @@
    remote STA association, uplink cooperative RX, helper-only AP mode,
    stats consistency, bidirectional traffic). Per-STA crypto key lookup
    verified with zero crypto/no_sta errors.
-10. **SW decryption** — helper frames on WPA2 are SW-decrypted using primary's
+10. **AP CSA** — `hostapd_cli chan_switch` followed by helper via
+    `createbss_hdl` hook. Stress-tested with 8 consecutive CSA cycles
+    (149↔157, 5s apart), all passed — state ACTIVE throughout, zero
+    crypto errors, helper channel matches primary after every switch.
+11. **SW decryption** — helper frames on WPA2 are SW-decrypted using primary's
     pairwise key via `recv_func_posthandle()`. CCMP PN replay check provides
     natural duplicate suppression.
-11. **Helper monitor mode** — `enable_helper_monitor()` brings interface UP,
-    sets radiotap type, configures WIFI_MONITOR_STATE, disables ACS, blocks
-    cfg80211 scans. Helper stays locked on bound channel.
-12. **Channel switch (CSA)** — helpers follow primary to new channel
-    automatically via `rtw_coop_rx_notify_channel_switch()`
-13. **Recv frame pool isolation** — helper frames transferred to primary pool
-14. **Per-STA non-QoS dedup** — cache entries keyed on (seq, TA), prevents
+12. **Helper monitor mode** — `enable_helper_monitor()` brings interface UP
+    (if DOWN), sets radiotap type, configures WIFI_MONITOR_STATE, disables
+    ACS, blocks cfg80211 scans. Helper stays locked on bound channel.
+13. **STA CSA** — helpers follow primary to new channel automatically via
+    `set_ch_hdl` and `rtw_dfs_ch_switch_hdl` hooks
+14. **Recv frame pool isolation** — helper frames transferred to primary pool
+15. **Per-STA non-QoS dedup** — cache entries keyed on (seq, TA), prevents
     false dups from different STAs in AP mode
-15. **RSSI observability** — `helper_rx_rssi_better/worse` counters track
+16. **RSSI observability** — `helper_rx_rssi_better/worse` counters track
     signal quality comparison between helper and primary
-16. **Sysfs input validation** — non-RTW interface names rejected
-17. **Namespace-aware** — sysfs pair/unpair use `rtw_get_same_net_ndev_by_name()`
+17. **Sysfs input validation** — non-RTW interface names rejected
+18. **Namespace-aware** — sysfs pair/unpair use `rtw_get_same_net_ndev_by_name()`
 
 ## What WAS FIXED (2026-03-19)
 

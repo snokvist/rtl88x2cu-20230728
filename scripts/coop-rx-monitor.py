@@ -4,6 +4,7 @@ coop-rx-monitor — Interactive monitor for RTL8822CU cooperative RX diversity
 
 Reads /sys/kernel/debug/rtw_coop_rx/stats and the driver's coop_rx_info
 sysfs endpoint to display a live dashboard of cooperative RX performance.
+Supports both STA and AP primary modes.
 
 Usage:
   sudo python3 coop-rx-monitor.py           # curses TUI dashboard

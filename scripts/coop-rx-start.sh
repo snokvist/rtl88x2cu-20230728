@@ -225,5 +225,7 @@ cat /sys/kernel/debug/rtw_coop_rx/stats 2>/dev/null
 echo ""
 info "Commands:"
 echo "  Monitor:  sudo python3 $(cd "$(dirname "$0")" && pwd)/coop-rx-monitor.py"
-echo "  Stats:    watch -n1 cat /sys/kernel/debug/rtw_coop_rx/stats"
+echo "  Test:     sudo $(cd "$(dirname "$0")" && pwd)/coop-rx-test.sh"
 echo "  Stop:     sudo $(cd "$(dirname "$0")" && pwd)/coop-rx-stop.sh"
+echo ""
+echo "  For AP mode, see: coop-rx-ap-test-start.sh"

@@ -801,7 +801,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	struct sta_info *psta;
 	union recv_frame *pframe_primary;
 	struct recv_priv *precvpriv_primary;
-	int ret = _FAIL;
 
 	rcu_read_lock();
 
