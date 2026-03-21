@@ -499,6 +499,15 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	u8 bw = CHANNEL_WIDTH_20;
 	u8 offset = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
 
+	/* Ensure the interface is UP — the driver's ndo_open handler
+	 * initializes USB URBs and hardware state. Without this, the
+	 * radio doesn't receive any frames. Safe to call if already UP. */
+	if (!(ndev->flags & IFF_UP)) {
+		rtnl_lock();
+		dev_open(ndev, NULL);
+		rtnl_unlock();
+	}
+
 	/* Set netdev type for radiotap headers */
 	ndev->type = ARPHRD_IEEE80211_RADIOTAP;
 
@@ -1562,10 +1571,13 @@ static ssize_t coop_rx_show_info(struct device *dev,
 
 		len += scnprintf(buf + len, PAGE_SIZE - len,
 			"primary_iface=%s\n"
+			"primary_mode=%s\n"
 			"primary_channel=%u\n"
 			"primary_rssi=%d\n"
 			"primary_signal=%u\n",
 			pri->pnetdev ? pri->pnetdev->name : "?",
+			MLME_IS_AP(pri) ? "AP" :
+			MLME_IS_STA(pri) ? "STA" : "?",
 			pmlmeext->cur_channel,
 			precvpriv->rssi,
 			precvpriv->signal_strength);

@@ -181,7 +181,11 @@ def print_status():
     print()
 
     # Primary
-    status = "CONNECTED" if pri_connected else "DOWN"
+    pri_mode = info.get("primary_mode", "STA")
+    if pri_mode == "AP":
+        status = "AP RUNNING" if pri_connected else "AP DOWN"
+    else:
+        status = "CONNECTED" if pri_connected else "DOWN"
     ssid_part = f"  {pri_ssid}" if pri_ssid else ""
     rssi_part = f"  {pri_rssi} dBm (signal {pri_signal}%)" if pri_rssi != "?" else ""
     print(f"  PRIMARY  {pri_iface:<24s} [{status}] ch={pri_ch}{rssi_part}{ssid_part}")
@@ -349,10 +353,14 @@ def draw(stdscr):
         state_num = stats.get("state", 0)
         state_name = info.get("state_name", STATE_NAMES.get(state_num, "?"))
         state_color = STATE_COLORS.get(state_num, 5)
+        pri_mode = info.get("primary_mode", "STA")
         safe_addstr(stdscr, row, 2, "State: ", BOLD)
         safe_addstr(stdscr, row, 9, state_name,
                     BOLD | curses.color_pair(state_color))
-        col = 9 + len(state_name) + 2
+        col = 9 + len(state_name) + 1
+        safe_addstr(stdscr, row, col, f"({pri_mode})",
+                    curses.color_pair(4))
+        col += len(pri_mode) + 3
         bssid = info.get("bssid", stats.get("bound_bssid", "\u2014"))
         ch = info.get("channel", str(stats.get("bound_channel", "\u2014")))
         pri_ch = info.get("primary_channel", ch)
@@ -377,8 +385,12 @@ def draw(stdscr):
         row += 1
 
         if primary:
+            pri_mode = info.get("primary_mode", "STA")
             pri_connected = info.get("primary_connected", "0") == "1"
-            status = "CONNECTED" if pri_connected else "DOWN"
+            if pri_mode == "AP":
+                status = "AP RUNNING" if pri_connected else "AP DOWN"
+            else:
+                status = "CONNECTED" if pri_connected else "DOWN"
             sc = 2 if pri_connected else 1
             safe_addstr(stdscr, row, 3, "PRIMARY", BOLD)
             safe_addstr(stdscr, row, 12, info.get("primary_iface", primary))
