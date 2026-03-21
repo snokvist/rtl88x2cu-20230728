@@ -443,12 +443,9 @@ def draw(stdscr):
 
         # === Throughput (3-way split) ===
         #
-        # Kernel rx_packets includes management/beacon frames, so we
-        # can't use it directly for the data-frame split. Instead:
-        # - Helper data rate: helper_rx_accepted/sec × avg_frame_bytes
-        #   (avg_frame_bytes = stack rx_bytes/rx_packets)
-        # - Primary data rate: total stack rate - helper data rate
-        # - Total: stack rx_bytes rate (ground truth)
+        # With drop_primary=1, kernel rx_bytes/rx_packets stop counting
+        # (helper-injected frames bypass count_rx_stats). We detect this
+        # and estimate throughput from coop stats + cached frame size.
         safe_addstr(stdscr, row, 2, "Throughput", BOLD | curses.color_pair(4))
         safe_addstr(stdscr, row, 50, "rate", DIM)
         safe_addstr(stdscr, row, 63, "total", DIM)
@@ -460,37 +457,50 @@ def draw(stdscr):
             total_pps = rates.get(f"{primary}_rx_pps", 0)
             helper_fps = rates.get("helper_rx_accepted", 0)
 
-            # Estimate avg frame size from stack counters
-            avg_frame_bytes = 0
+            # Track avg frame size from stack counters when available.
+            # Cache it so drop_primary mode can use the last-known value.
             if total_pps > 1:
-                avg_frame_bytes = (total_bps / 8) / total_pps  # bytes/pkt
+                rates["_avg_frame_bytes"] = (total_bps / 8) / total_pps
+            avg_frame_bytes = rates.get("_avg_frame_bytes", 800)  # 800B default
 
-            # Helper bitrate = accepted frames/sec × avg frame size × 8
-            helper_bps = helper_fps * avg_frame_bytes * 8 if avg_frame_bytes > 0 else 0
-            # Clamp: helper can't exceed total
-            helper_bps = min(helper_bps, total_bps)
-            # Primary = remainder
-            primary_bps = max(total_bps - helper_bps, 0)
+            # Helper bitrate from accepted rate × avg frame size
+            helper_bps = helper_fps * avg_frame_bytes * 8
+
+            if total_bps > 100:
+                # Normal mode: kernel counters are live
+                helper_bps = min(helper_bps, total_bps)
+                primary_bps = max(total_bps - helper_bps, 0)
+                effective_total = total_bps
+            elif helper_fps > 1:
+                # drop_primary mode: kernel counters are zero but
+                # helper frames are flowing — estimate from coop stats
+                primary_bps = 0
+                effective_total = helper_bps
+            else:
+                primary_bps = 0
+                helper_bps = 0
+                effective_total = 0
 
             # Percentages
-            if total_bps > 100:
-                helper_frac = helper_bps / total_bps
-                primary_frac = primary_bps / total_bps
+            if effective_total > 100:
+                helper_frac = helper_bps / effective_total
+                primary_frac = primary_bps / effective_total
             else:
                 helper_frac = 0
-                primary_frac = 1.0
+                primary_frac = 0 if drop_primary else 1.0
 
             # Total output
             safe_addstr(stdscr, row, 3, "Total output (to stack)")
             safe_addstr(stdscr, row, 46,
-                        f"{fmt_rate(total_bps):>10s}", BOLD | curses.color_pair(2))
+                        f"{fmt_rate(effective_total):>10s}",
+                        BOLD | curses.color_pair(2))
             safe_addstr(stdscr, row, 59,
                         f"{fmt_bytes(rx_b):>10s}")
             row += 1
 
             # Primary radio contribution
             pc = 2 if primary_frac > 0.5 else (3 if primary_frac > 0.1 else 1)
-            pct_str = f"({primary_frac*100:.0f}%)" if total_bps > 100 else ""
+            pct_str = f"({primary_frac*100:.0f}%)" if effective_total > 100 else ""
             safe_addstr(stdscr, row, 3, f"  Primary radio {pct_str}")
             safe_addstr(stdscr, row, 46,
                         f"{fmt_rate(primary_bps):>10s}",
@@ -499,7 +509,7 @@ def draw(stdscr):
 
             # Helper contribution
             hc = 2 if helper_frac > 0.01 else 5
-            hpct_str = f"({helper_frac*100:.0f}%)" if total_bps > 100 else ""
+            hpct_str = f"({helper_frac*100:.0f}%)" if effective_total > 100 else ""
             safe_addstr(stdscr, row, 3, f"  Helper injected {hpct_str}")
             safe_addstr(stdscr, row, 46,
                         f"{fmt_rate(helper_bps):>10s}",
