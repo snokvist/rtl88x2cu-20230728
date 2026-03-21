@@ -101,6 +101,7 @@ info "Primary interface: $PRIMARY"
 # --- Phase 3: Connect primary -------------------------------------------------
 
 WPA_CONF="/tmp/coop_rx_primary.conf"
+umask 077
 cat > "$WPA_CONF" <<EOF
 ctrl_interface=/var/run/wpa_supplicant
 ctrl_interface_group=0

@@ -85,6 +85,7 @@ if [ -z "$PRIMARY" ]; then
     killall wpa_supplicant 2>/dev/null || true
     sleep 1
 
+    umask 077
     cat > /tmp/coop_wpa.conf <<EOF
 network={
     ssid="$SSID"

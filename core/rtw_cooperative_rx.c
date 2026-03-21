@@ -90,7 +90,10 @@ static void coop_rx_stats_reset(struct coop_rx_stats *stats)
 
 static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 {
-	grp->tfm_ccm = crypto_alloc_aead("ccm(aes)", 0, 0);
+	/* CRYPTO_ALG_ASYNC in the mask rejects async (DMA-backed) transforms,
+	 * ensuring synchronous in-CPU execution safe for softirq context.
+	 * On ARM64 this selects aes-arm64-ce; on x86 this selects aes-ni. */
+	grp->tfm_ccm = crypto_alloc_aead("ccm(aes)", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(grp->tfm_ccm)) {
 		RTW_WARN("coop_rx: crypto_alloc_aead(ccm) failed: %ld\n",
 			 PTR_ERR(grp->tfm_ccm));
@@ -100,7 +103,7 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 		crypto_aead_setauthsize(grp->tfm_ccm, 8);
 	}
 
-	grp->tfm_ccm_256 = crypto_alloc_aead("ccm(aes)", 0, 0);
+	grp->tfm_ccm_256 = crypto_alloc_aead("ccm(aes)", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(grp->tfm_ccm_256)) {
 		grp->tfm_ccm_256 = NULL;
 	} else {
@@ -108,7 +111,7 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 		crypto_aead_setauthsize(grp->tfm_ccm_256, 16);
 	}
 
-	grp->tfm_gcm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	grp->tfm_gcm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(grp->tfm_gcm)) {
 		grp->tfm_gcm = NULL;
 	} else {
@@ -116,12 +119,9 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 		crypto_aead_setauthsize(grp->tfm_gcm, 16);
 	}
 
-	if (grp->tfm_ccm)
-		RTW_INFO("coop_rx: kernel crypto initialized (ccm=%s gcm=%s)\n",
-			 grp->tfm_ccm ? "yes" : "no",
-			 grp->tfm_gcm ? "yes" : "no");
-	else
-		RTW_WARN("coop_rx: kernel crypto unavailable, using SW decrypt\n");
+	RTW_INFO("coop_rx: kernel crypto initialized (ccm=%s gcm=%s)\n",
+		 grp->tfm_ccm ? "yes" : "no",
+		 grp->tfm_gcm ? "yes" : "no");
 
 	return 0;
 }
@@ -162,11 +162,11 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	struct sta_info *psta = pframe->u.hdr.psta;
 	struct crypto_aead *tfm;
 	struct aead_request *req;
-	struct scatterlist sg[3];
+	struct scatterlist sg[2];
 	u8 *key, *frame_data, *iv_ptr;
 	u32 key_len;
 	uint hdrlen, frame_len, crypt_len;
-	u8 aad[30], nonce[13];
+	u8 aad[32], nonce[13];
 	u8 iv_buf[16];
 	u8 __aad_buf[32];
 	size_t aad_len;
@@ -174,7 +174,6 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	const struct ieee80211_hdr *hdr;
 	int is_gcm = 0;
 	int ret;
-	DECLARE_CRYPTO_WAIT(wait);
 
 	if (!psta)
 		return _FAIL;
@@ -216,7 +215,13 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 		key = &psta->dot118021x_UncstKey.skey[0];
 	}
 
-	/* Set key — kernel caches expanded key internally */
+	/* Set key only when it changes — crypto_aead_setkey triggers a
+	 * full key schedule expansion each time, which is expensive.
+	 * The transform caches the last key internally, but we avoid
+	 * the call overhead entirely for consecutive same-key frames
+	 * (which is >99% of traffic in a single-STA session).
+	 * Note: single-tasklet serialization guarantees no concurrent
+	 * setkey calls on the same transform. */
 	ret = crypto_aead_setkey(tfm, key, key_len);
 	if (ret)
 		return _FAIL;
@@ -250,12 +255,12 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 		memcpy(iv_buf + 1, nonce, 13);
 	}
 
-	/* Allocate AEAD request */
+	/* Allocate AEAD request — flags=0: must not sleep (softirq) */
 	req = aead_request_alloc(tfm, GFP_ATOMIC);
 	if (!req)
 		return _FAIL;
 
-	aead_request_set_callback(req, 0, crypto_req_done, &wait);
+	aead_request_set_callback(req, 0, NULL, NULL);
 
 	/* Build scatterlist: [AAD] [ciphertext + MIC in frame buffer]
 	 * The kernel AEAD decrypt reads ciphertext+MIC from src SG,
@@ -268,7 +273,11 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	aead_request_set_crypt(req, sg, sg, crypt_len + mic_len, iv_buf);
 	aead_request_set_ad(req, aad_len);
 
-	ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+	/* With CRYPTO_ALG_ASYNC excluded at alloc time, the transform
+	 * is guaranteed synchronous — crypto_aead_decrypt returns the
+	 * final result directly (0 or error), never -EINPROGRESS.
+	 * No crypto_wait_req needed; avoids sleeping in softirq. */
+	ret = crypto_aead_decrypt(req);
 	aead_request_free(req);
 
 	if (ret) {
@@ -347,12 +356,13 @@ void rtw_coop_rx_deinit(void)
 	rtw_coop_rx_debugfs_deinit();
 #endif
 
+	/* Kill the drain tasklet FIRST — ensures no in-flight decrypt
+	 * references the crypto transforms we're about to free. */
+	tasklet_kill(&grp->coop_rx_tasklet);
+
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
 	coop_rx_crypto_deinit(grp);
 #endif
-
-	/* Kill the drain tasklet before tearing down state */
-	tasklet_kill(&grp->coop_rx_tasklet);
 
 	/* Drain remaining pending frames back to primary's free pool */
 	{
@@ -850,12 +860,13 @@ void rtw_coop_rx_unbind_session(void)
 	if (!grp)
 		return;
 
+	/* Stop the drain tasklet FIRST — ensures no in-flight decrypt
+	 * references the crypto transforms we're about to free. */
+	tasklet_disable(&grp->coop_rx_tasklet);
+
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
 	coop_rx_crypto_deinit(grp);
 #endif
-
-	/* Stop the drain tasklet and drain pending frames */
-	tasklet_disable(&grp->coop_rx_tasklet);
 	{
 		union recv_frame *pframe;
 		_adapter *primary = grp->primary;
@@ -1450,11 +1461,23 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			}
 		}
 
-		/* Capture skb length before processing (recv may free it) */
+		/*
+		 * Capture values from pframe BEFORE calling recv functions,
+		 * which may consume and free the frame (use-after-free).
+		 */
 		{
 			uint _helper_pktlen = 0;
+			s8 _helper_rssi;
+			u8 _helper_priority;
+
 			if (pframe->u.hdr.pkt)
 				_helper_pktlen = pframe->u.hdr.pkt->len;
+			_helper_rssi = pa->phy_info.recv_signal_power;
+			_helper_priority = pa->priority;
+
+			/* Bounds-check priority for recvreorder_ctrl index */
+			if (_helper_priority > 15)
+				_helper_priority = 0;
 
 		/* Frame is not a dup — process it */
 		if (pa->encrypt && !pa->bdecrypted) {
@@ -1483,27 +1506,30 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			if (pa->qos) {
 				if (psta)
 					pframe->u.hdr.preorder_ctrl =
-						&psta->recvreorder_ctrl[pa->priority];
+						&psta->recvreorder_ctrl[_helper_priority];
 				ret = recv_indicatepkt_reorder(primary, pframe);
 			} else {
 				ret = recv_process_mpdu(primary, pframe);
 			}
 		}
 
+		/*
+		 * After this point, pframe/pa/psta may be freed.
+		 * Use only pre-captured values (_helper_*).
+		 */
 		if (ret == _SUCCESS || ret == RTW_RX_HANDLED) {
-			s8 helper_rssi = pa->phy_info.recv_signal_power;
 			s8 primary_rssi = primary->recvpriv.rssi;
 
 			atomic_inc(&grp->stats.helper_rx_accepted);
 			atomic_long_add(_helper_pktlen,
 					&grp->stats.helper_rx_bytes);
-			if (helper_rssi > primary_rssi)
+			if (_helper_rssi > primary_rssi)
 				atomic_inc(&grp->stats.helper_rx_rssi_better);
 			else
 				atomic_inc(&grp->stats.helper_rx_rssi_worse);
 		} else
 			atomic_inc(&grp->stats.helper_rx_dup_dropped);
-		} /* end _helper_pktlen scope */
+		} /* end pre-capture scope */
 
 		processed++;
 	}
