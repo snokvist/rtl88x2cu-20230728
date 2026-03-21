@@ -161,9 +161,50 @@ Combine Options A and B:
 processes first in >99% of cases, and removing the WRITE_ONCE means
 the drain tasklet never steals frames from the primary.
 
-## Recommendation
+## Conclusion: No Change Needed (Dead End)
 
-**Option C (Hybrid)** is the recommended approach:
+**Investigated 2025-03-21. Verdict: not worth changing.**
+
+The kernel crypto API fix (commit 2b7b375) reduced helper SW decrypt
+from ~80-100µs to ~2-5µs per frame on ARM64 CE. At 800fps, the helper
+winning the race costs 0.2-0.4% CPU — negligible for any target.
+
+Adding a timer delay to prioritize primary would ADD latency to the FPV
+stream (3ms+) to save 0.2% CPU. That's the wrong trade-off for a
+latency-critical video application.
+
+**Why the helper is inherently faster:** The RTL8812CU firmware does less
+work in monitor mode (no CAM lookup, no HW decrypt, no association
+checks). The raw frame exits firmware and hits USB before the primary's
+firmware finishes HW decrypting. This is a firmware-level timing
+difference that can't be changed without adding artificial delay.
+
+**Why removing WRITE_ONCE (Option B) doesn't help:** The helper still
+wins the race regardless. Removing the write would let the primary also
+process its copy, but the CCMP PN replay check catches the duplicate
+during decrypt. Net effect: same behavior with slightly more wasted work
+in the primary path. Not worth the change.
+
+**Multiple helpers:** Only one helper copy is SW-decrypted per unique
+WiFi frame. The drain tasklet's seq_ctrl dedup catches subsequent
+helper copies. Adding more helpers does NOT multiply decrypt cost.
+
+**Status: CLOSED. Revisit only if kernel crypto becomes unavailable
+on a target platform (falling back to pure C AES would re-open the
+CPU cost concern).**
+
+---
+
+*The original analysis below is preserved for reference.*
+
+## Original Analysis (Options A/B/C)
+
+### Option A — Delayed Drain (REJECTED: adds FPV latency)
+
+## Recommendation (SUPERSEDED)
+
+**Option C (Hybrid)** was the original recommendation but is now
+**superseded by the "no change needed" conclusion above**:
 
 1. Add `struct timer_list drain_timer` with 3ms delay
 2. Replace `tasklet_schedule()` in submit_helper_frame with `mod_timer()`
