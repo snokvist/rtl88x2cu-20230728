@@ -1188,6 +1188,37 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			WRITE_ONCE(*prxseq, seq_ctrl);
 		}
 
+		/*
+		 * Pre-decrypt reorder window check: if the primary's
+		 * window has advanced past this seq_num, it already
+		 * indicated it. Reading indicate_seq without the reorder
+		 * lock is safe: it only advances monotonically, so a
+		 * stale read = false negative (miss a dup), never false
+		 * positive (drop a valid frame).
+		 */
+		if (pa->qos && psta) {
+			u8 ptid = pa->priority;
+
+			if (ptid <= 15) {
+				struct recv_reorder_ctrl *preorder =
+					&psta->recvreorder_ctrl[ptid];
+				u16 ind_seq =
+					READ_ONCE(preorder->indicate_seq);
+
+				if (preorder->enable &&
+				    ind_seq != 0xFFFF &&
+				    SN_LESS(pa->seq_num, ind_seq)) {
+					atomic_inc(&grp->stats
+						   .helper_rx_dup_dropped);
+					rtw_free_recvframe(pframe,
+						&primary->recvpriv
+						.free_recv_queue);
+					processed++;
+					continue;
+				}
+			}
+		}
+
 		/* Frame is not a dup — process it */
 		if (pa->encrypt && !pa->bdecrypted) {
 			ret = recv_func_posthandle(primary, pframe);
