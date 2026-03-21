@@ -12933,6 +12933,9 @@ u8 createbss_hdl(_adapter *padapter, u8 *pbuf)
 				rtw_csa_update_clients_ramask(iface);
 			}
 			RTW_INFO("csa : clear ap_csa_wait_update_bcn after update beacon done\n");
+
+			/* Move cooperative RX helpers to the new AP channel */
+			rtw_coop_rx_notify_channel_switch(padapter);
 		}
 
 		/* Switch channel done, not update beacon from hostapd yet */

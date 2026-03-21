@@ -133,6 +133,7 @@ HOSTAPD_CONF="/tmp/coop_rx_ap_test.conf"
 cat > "$HOSTAPD_CONF" <<EOF
 interface=$PRIMARY
 driver=nl80211
+ctrl_interface=/var/run/hostapd
 ssid=$AP_SSID
 country_code=$AP_COUNTRY
 hw_mode=a
