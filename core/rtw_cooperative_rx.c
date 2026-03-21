@@ -69,6 +69,7 @@ static void coop_rx_stats_reset(struct coop_rx_stats *stats)
 	atomic_set(&stats->pair_events, 0);
 	atomic_set(&stats->unpair_events, 0);
 	atomic_set(&stats->helper_rx_kern_crypto, 0);
+	atomic_long_set(&stats->helper_rx_bytes, 0);
 }
 
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
@@ -1449,6 +1450,12 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			}
 		}
 
+		/* Capture skb length before processing (recv may free it) */
+		{
+			uint _helper_pktlen = 0;
+			if (pframe->u.hdr.pkt)
+				_helper_pktlen = pframe->u.hdr.pkt->len;
+
 		/* Frame is not a dup — process it */
 		if (pa->encrypt && !pa->bdecrypted) {
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
@@ -1488,12 +1495,15 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			s8 primary_rssi = primary->recvpriv.rssi;
 
 			atomic_inc(&grp->stats.helper_rx_accepted);
+			atomic_long_add(_helper_pktlen,
+					&grp->stats.helper_rx_bytes);
 			if (helper_rssi > primary_rssi)
 				atomic_inc(&grp->stats.helper_rx_rssi_better);
 			else
 				atomic_inc(&grp->stats.helper_rx_rssi_worse);
 		} else
 			atomic_inc(&grp->stats.helper_rx_dup_dropped);
+		} /* end _helper_pktlen scope */
 
 		processed++;
 	}
@@ -1613,7 +1623,8 @@ static int coop_rx_format_stats(char *buf, size_t size,
 		"fallback_events: %d\n"
 		"pair_events: %d\n"
 		"unpair_events: %d\n"
-		"helper_rx_kern_crypto: %d\n",
+		"helper_rx_kern_crypto: %d\n"
+		"helper_rx_bytes: %ld\n",
 		grp->state,
 		grp->state == COOP_STATE_DISABLED ? "DISABLED" :
 		grp->state == COOP_STATE_IDLE ? "IDLE" :
@@ -1639,7 +1650,8 @@ static int coop_rx_format_stats(char *buf, size_t size,
 		atomic_read(&grp->stats.fallback_events),
 		atomic_read(&grp->stats.pair_events),
 		atomic_read(&grp->stats.unpair_events),
-		atomic_read(&grp->stats.helper_rx_kern_crypto));
+		atomic_read(&grp->stats.helper_rx_kern_crypto),
+		atomic_long_read(&grp->stats.helper_rx_bytes));
 }
 
 static ssize_t coop_rx_show_stats(struct device *dev,

@@ -317,6 +317,12 @@ def draw(stdscr):
                 raw = (stats.get(counter, 0) - prev_stats.get(counter, 0)) / dt
                 rates[counter] = ema(rates.get(counter), raw)
 
+            # Helper byte rate (bits/sec) from driver counter
+            hb_delta = stats.get("helper_rx_bytes", 0) - prev_stats.get("helper_rx_bytes", 0)
+            if hb_delta >= 0:
+                rates["helper_rx_bytes_bps"] = ema(
+                    rates.get("helper_rx_bytes_bps"), hb_delta * 8 / dt)
+
         for iface in (primary, helper):
             if iface and iface in cur_net and iface in prev_net and dt > 0:
                 rx_bps = (cur_net[iface]["rx_bytes"] - prev_net[iface]["rx_bytes"]) * 8 / dt
@@ -443,9 +449,11 @@ def draw(stdscr):
 
         # === Throughput (3-way split) ===
         #
-        # With drop_primary=1, kernel rx_bytes/rx_packets stop counting
-        # (helper-injected frames bypass count_rx_stats). We detect this
-        # and estimate throughput from coop stats + cached frame size.
+        # helper_rx_bytes is a driver counter tracking actual bytes
+        # delivered from helper frames. Combined with kernel rx_bytes
+        # (which counts all stack-delivered traffic), we get accurate
+        # primary vs helper split. With drop_primary=1, kernel rx_bytes
+        # is zero but helper_rx_bytes still counts, so we use it directly.
         safe_addstr(stdscr, row, 2, "Throughput", BOLD | curses.color_pair(4))
         safe_addstr(stdscr, row, 50, "rate", DIM)
         safe_addstr(stdscr, row, 63, "total", DIM)
@@ -454,26 +462,15 @@ def draw(stdscr):
         if primary and primary in cur_net:
             rx_b = cur_net[primary]["rx_bytes"]
             total_bps = rates.get(f"{primary}_rx_bps", 0)
-            total_pps = rates.get(f"{primary}_rx_pps", 0)
-            helper_fps = rates.get("helper_rx_accepted", 0)
-
-            # Track avg frame size from stack counters when available.
-            # Cache it so drop_primary mode can use the last-known value.
-            if total_pps > 1:
-                rates["_avg_frame_bytes"] = (total_bps / 8) / total_pps
-            avg_frame_bytes = rates.get("_avg_frame_bytes", 800)  # 800B default
-
-            # Helper bitrate from accepted rate × avg frame size
-            helper_bps = helper_fps * avg_frame_bytes * 8
+            helper_bps = rates.get("helper_rx_bytes_bps", 0)
 
             if total_bps > 100:
-                # Normal mode: kernel counters are live
+                # Normal mode: kernel counters track total
                 helper_bps = min(helper_bps, total_bps)
                 primary_bps = max(total_bps - helper_bps, 0)
                 effective_total = total_bps
-            elif helper_fps > 1:
-                # drop_primary mode: kernel counters are zero but
-                # helper frames are flowing — estimate from coop stats
+            elif helper_bps > 100:
+                # drop_primary mode: only helper bytes flowing
                 primary_bps = 0
                 effective_total = helper_bps
             else:

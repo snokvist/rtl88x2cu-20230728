@@ -63,6 +63,7 @@ struct coop_rx_stats {
 	atomic_t pair_events;		/* successful pairings */
 	atomic_t unpair_events;		/* teardown events */
 	atomic_t helper_rx_kern_crypto;	/* frames decrypted via kernel crypto */
+	atomic_long_t helper_rx_bytes;	/* bytes delivered from helper frames */
 };
 
 /*
