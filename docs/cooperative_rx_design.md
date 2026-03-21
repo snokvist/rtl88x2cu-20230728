@@ -438,6 +438,7 @@ This is a significant engineering effort and is not planned.
 | Scan block | `os_dep/linux/ioctl_cfg80211.c` in `cfg80211_rtw_scan()` | `if (rtw_coop_rx_is_helper(padapter)) { indicate_scan_done; goto exit; }` |
 | CSA follow | `core/rtw_cmd.c` in `rtw_dfs_ch_switch_hdl()` | `rtw_coop_rx_notify_channel_switch(pri_adapter);` after `set_channel_bwmode` |
 | Channel set | `core/rtw_mlme_ext.c` in `set_ch_hdl()` | `rtw_coop_rx_notify_channel_switch(padapter);` after channel update |
+| AP CSA | `core/rtw_mlme_ext.c` in `createbss_hdl()` | `rtw_coop_rx_notify_channel_switch(padapter);` after `ap_csa_wait_update_bcn` clears |
 | Init/deinit | `os_dep/linux/usb_intf.c` | `rtw_coop_rx_init()` before `usb_register()`, `rtw_coop_rx_deinit()` in exit + error path |
 | USB remove | `os_dep/linux/usb_intf.c` in `rtw_dev_remove()` | `rtw_coop_rx_remove_adapter(padapter);` before teardown |
 | Module params | `os_dep/linux/os_intfs.c` | `module_param` for `rtw_cooperative_rx` and `rtw_coop_rx_drop_primary` |
