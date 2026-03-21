@@ -14,8 +14,8 @@
 
 
 
-static void ccmp_aad_nonce(_adapter *padapter, const struct ieee80211_hdr *hdr, const u8 *data,
-			   u8 *aad, size_t *aad_len, u8 *nonce)
+void ccmp_aad_nonce(_adapter *padapter, const struct ieee80211_hdr *hdr, const u8 *data,
+		    u8 *aad, size_t *aad_len, u8 *nonce)
 {
 	u16 fc, stype, seq;
 	int qos = 0, addr4 = 0;

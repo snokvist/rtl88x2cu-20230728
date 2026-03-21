@@ -37,6 +37,12 @@
 #include <linux/seq_file.h>
 #endif
 
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+#include <crypto/aead.h>
+#include <linux/scatterlist.h>
+#include "wlancrypto_wrap.h"
+#endif
+
 /* Module parameter — 0=disabled (default), 1=enabled */
 int rtw_cooperative_rx = 0;
 
@@ -62,7 +68,219 @@ static void coop_rx_stats_reset(struct coop_rx_stats *stats)
 	atomic_set(&stats->fallback_events, 0);
 	atomic_set(&stats->pair_events, 0);
 	atomic_set(&stats->unpair_events, 0);
+	atomic_set(&stats->helper_rx_kern_crypto, 0);
 }
+
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+/*
+ * ============================================================
+ * Kernel Crypto API — HW-accelerated AES for coop RX decrypt
+ * ============================================================
+ *
+ * On ARM64 (Cortex-A55/A53/A76), the kernel dispatches to aes-arm64-ce
+ * which uses dedicated AESE/AESMC instructions — ~10-50x faster than
+ * the driver's pure C Rijndael implementation.
+ * On x86_64, it dispatches to aes-ni for similar acceleration.
+ *
+ * Transforms are allocated once per session (process context) and
+ * used from the drain tasklet (softirq context). Failure is non-fatal:
+ * NULL transforms cause fallback to the existing SW decrypt path.
+ */
+
+static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
+{
+	grp->tfm_ccm = crypto_alloc_aead("ccm(aes)", 0, 0);
+	if (IS_ERR(grp->tfm_ccm)) {
+		RTW_WARN("coop_rx: crypto_alloc_aead(ccm) failed: %ld\n",
+			 PTR_ERR(grp->tfm_ccm));
+		grp->tfm_ccm = NULL;
+	} else {
+		/* CCMP MIC length = 8 bytes */
+		crypto_aead_setauthsize(grp->tfm_ccm, 8);
+	}
+
+	grp->tfm_ccm_256 = crypto_alloc_aead("ccm(aes)", 0, 0);
+	if (IS_ERR(grp->tfm_ccm_256)) {
+		grp->tfm_ccm_256 = NULL;
+	} else {
+		/* CCMP-256 MIC length = 16 bytes */
+		crypto_aead_setauthsize(grp->tfm_ccm_256, 16);
+	}
+
+	grp->tfm_gcm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	if (IS_ERR(grp->tfm_gcm)) {
+		grp->tfm_gcm = NULL;
+	} else {
+		/* GCMP MIC length = 16 bytes */
+		crypto_aead_setauthsize(grp->tfm_gcm, 16);
+	}
+
+	if (grp->tfm_ccm)
+		RTW_INFO("coop_rx: kernel crypto initialized (ccm=%s gcm=%s)\n",
+			 grp->tfm_ccm ? "yes" : "no",
+			 grp->tfm_gcm ? "yes" : "no");
+	else
+		RTW_WARN("coop_rx: kernel crypto unavailable, using SW decrypt\n");
+
+	return 0;
+}
+
+static void coop_rx_crypto_deinit(struct cooperative_rx_group *grp)
+{
+	if (grp->tfm_ccm) {
+		crypto_free_aead(grp->tfm_ccm);
+		grp->tfm_ccm = NULL;
+	}
+	if (grp->tfm_ccm_256) {
+		crypto_free_aead(grp->tfm_ccm_256);
+		grp->tfm_ccm_256 = NULL;
+	}
+	if (grp->tfm_gcm) {
+		crypto_free_aead(grp->tfm_gcm);
+		grp->tfm_gcm = NULL;
+	}
+}
+
+/*
+ * coop_rx_kernel_decrypt — decrypt a helper frame using the kernel crypto API.
+ *
+ * Constructs CCMP/GCMP nonce and AAD from the 802.11 header, then calls
+ * crypto_aead_decrypt() which dispatches to the best available HW engine.
+ *
+ * Returns _SUCCESS on successful decrypt + MIC verify, _FAIL otherwise.
+ * On _FAIL, the caller falls back to the existing SW decrypt path.
+ *
+ * Context: softirq (drain tasklet) — crypto_aead_decrypt() is safe here.
+ */
+static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
+				  _adapter *primary,
+				  union recv_frame *pframe)
+{
+	struct rx_pkt_attrib *pa = &pframe->u.hdr.attrib;
+	struct security_priv *psec = &primary->securitypriv;
+	struct sta_info *psta = pframe->u.hdr.psta;
+	struct crypto_aead *tfm;
+	struct aead_request *req;
+	struct scatterlist sg[3];
+	u8 *key, *frame_data, *iv_ptr;
+	u32 key_len;
+	uint hdrlen, frame_len, crypt_len;
+	u8 aad[30], nonce[13];
+	u8 iv_buf[16];
+	u8 __aad_buf[32];
+	size_t aad_len;
+	uint mic_len;
+	const struct ieee80211_hdr *hdr;
+	int is_gcm = 0;
+	int ret;
+	DECLARE_CRYPTO_WAIT(wait);
+
+	if (!psta)
+		return _FAIL;
+
+	/* Select transform and MIC size */
+	switch (pa->encrypt) {
+	case _AES_:
+		tfm = grp->tfm_ccm;
+		mic_len = 8;
+		break;
+	case _CCMP_256_:
+		tfm = grp->tfm_ccm_256;
+		mic_len = 16;
+		break;
+	case _GCMP_:
+	case _GCMP_256_:
+		tfm = grp->tfm_gcm;
+		mic_len = 16;
+		is_gcm = 1;
+		break;
+	default:
+		return _FAIL; /* TKIP, WEP: use SW path */
+	}
+
+	if (!tfm)
+		return _FAIL; /* kernel crypto not available */
+
+	/* Look up key material */
+	key_len = (pa->encrypt == _CCMP_256_ ||
+		   pa->encrypt == _GCMP_256_) ? 32 : 16;
+
+	if (IS_MCAST(pa->ra)) {
+		if (!psec->binstallGrpkey)
+			return _FAIL;
+		if (psec->dot118021XGrpKeyid != pa->key_index)
+			return _FAIL;
+		key = psec->dot118021XGrpKey[pa->key_index].skey;
+	} else {
+		key = &psta->dot118021x_UncstKey.skey[0];
+	}
+
+	/* Set key — kernel caches expanded key internally */
+	ret = crypto_aead_setkey(tfm, key, key_len);
+	if (ret)
+		return _FAIL;
+
+	frame_data = pframe->u.hdr.rx_data;
+	hdrlen = pa->hdrlen;
+	frame_len = pframe->u.hdr.len;
+	iv_ptr = frame_data + hdrlen;
+
+	/* Payload = frame - hdr - IV(8) - MIC */
+	if (frame_len <= hdrlen + 8 + mic_len)
+		return _FAIL;
+	crypt_len = frame_len - hdrlen - 8 - mic_len;
+
+	/* Build nonce and AAD from 802.11 header */
+	hdr = (const struct ieee80211_hdr *)frame_data;
+	memset(aad, 0, sizeof(aad));
+
+	if (is_gcm) {
+		u8 gcm_nonce[12];
+
+		gcmp_aad_nonce(primary, hdr, iv_ptr, aad, &aad_len, gcm_nonce);
+		/* GCM IV = 12-byte nonce directly */
+		memset(iv_buf, 0, sizeof(iv_buf));
+		memcpy(iv_buf, gcm_nonce, 12);
+	} else {
+		ccmp_aad_nonce(primary, hdr, iv_ptr, aad, &aad_len, nonce);
+		/* CCM IV = {L-1=1, nonce[0..12], 0x00, 0x00} */
+		memset(iv_buf, 0, sizeof(iv_buf));
+		iv_buf[0] = 1; /* L-1 = 2-1 = 1 for CCMP (L=2) */
+		memcpy(iv_buf + 1, nonce, 13);
+	}
+
+	/* Allocate AEAD request */
+	req = aead_request_alloc(tfm, GFP_ATOMIC);
+	if (!req)
+		return _FAIL;
+
+	aead_request_set_callback(req, 0, crypto_req_done, &wait);
+
+	/* Build scatterlist: [AAD] [ciphertext + MIC in frame buffer]
+	 * The kernel AEAD decrypt reads ciphertext+MIC from src SG,
+	 * writes plaintext to dst SG (we use same buffer = in-place). */
+	memcpy(__aad_buf, aad, aad_len);
+	sg_init_table(sg, 2);
+	sg_set_buf(&sg[0], __aad_buf, aad_len);
+	sg_set_buf(&sg[1], iv_ptr + 8, crypt_len + mic_len);
+
+	aead_request_set_crypt(req, sg, sg, crypt_len + mic_len, iv_buf);
+	aead_request_set_ad(req, aad_len);
+
+	ret = crypto_wait_req(crypto_aead_decrypt(req), &wait);
+	aead_request_free(req);
+
+	if (ret) {
+		/* MIC failure or decrypt error — fall back to SW */
+		return _FAIL;
+	}
+
+	/* Successfully decrypted in-place */
+	pa->bdecrypted = 1;
+	atomic_inc(&grp->stats.helper_rx_kern_crypto);
+	return _SUCCESS;
+}
+#endif /* CONFIG_COOP_RX_KERNEL_CRYPTO */
 
 /* Debug: drop all primary RX data frames to test helper-only path */
 int rtw_coop_rx_drop_primary = 0;
@@ -126,6 +344,10 @@ void rtw_coop_rx_deinit(void)
 
 #ifdef CONFIG_DEBUG_FS
 	rtw_coop_rx_debugfs_deinit();
+#endif
+
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+	coop_rx_crypto_deinit(grp);
 #endif
 
 	/* Kill the drain tasklet before tearing down state */
@@ -456,6 +678,10 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 	if (grp->num_helpers > 0)
 		grp->state = COOP_STATE_ACTIVE;
 
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+	coop_rx_crypto_init(grp);
+#endif
+
 	/* Snapshot helpers under lock, then release before calling
 	 * rtw_setopmode_cmd (which sleeps). After release, the live
 	 * helpers[] array may change, but our snapshot is safe. */
@@ -622,6 +848,10 @@ void rtw_coop_rx_unbind_session(void)
 	grp = READ_ONCE(rtw_coop_rx_group);
 	if (!grp)
 		return;
+
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+	coop_rx_crypto_deinit(grp);
+#endif
 
 	/* Stop the drain tasklet and drain pending frames */
 	tasklet_disable(&grp->coop_rx_tasklet);
@@ -1188,10 +1418,61 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 			WRITE_ONCE(*prxseq, seq_ctrl);
 		}
 
+		/*
+		 * Pre-decrypt reorder window check: if the primary's
+		 * window has advanced past this seq_num, it already
+		 * indicated it. Reading indicate_seq without the reorder
+		 * lock is safe: it only advances monotonically, so a
+		 * stale read = false negative (miss a dup), never false
+		 * positive (drop a valid frame).
+		 */
+		if (pa->qos && psta) {
+			u8 ptid = pa->priority;
+
+			if (ptid <= 15) {
+				struct recv_reorder_ctrl *preorder =
+					&psta->recvreorder_ctrl[ptid];
+				u16 ind_seq =
+					READ_ONCE(preorder->indicate_seq);
+
+				if (preorder->enable &&
+				    ind_seq != 0xFFFF &&
+				    SN_LESS(pa->seq_num, ind_seq)) {
+					atomic_inc(&grp->stats
+						   .helper_rx_dup_dropped);
+					rtw_free_recvframe(pframe,
+						&primary->recvpriv
+						.free_recv_queue);
+					processed++;
+					continue;
+				}
+			}
+		}
+
 		/* Frame is not a dup — process it */
 		if (pa->encrypt && !pa->bdecrypted) {
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+			/* Try kernel crypto first (HW-accelerated) */
+			if (pa->encrypt == _AES_ ||
+			    pa->encrypt == _CCMP_256_ ||
+			    pa->encrypt == _GCMP_ ||
+			    pa->encrypt == _GCMP_256_) {
+				u8 *iv = pframe->u.hdr.rx_data +
+					 pa->hdrlen;
+				pa->key_index = (iv[3] >> 6) & 0x3;
+
+				ret = coop_rx_kernel_decrypt(grp, primary,
+							     pframe);
+				if (ret == _SUCCESS)
+					goto coop_post_decrypt;
+				/* Fall through to SW path on failure */
+			}
+#endif
 			ret = recv_func_posthandle(primary, pframe);
 		} else {
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+		coop_post_decrypt:
+#endif
 			if (pa->qos) {
 				if (psta)
 					pframe->u.hdr.preorder_ctrl =
@@ -1331,7 +1612,8 @@ static int coop_rx_format_stats(char *buf, size_t size,
 		"pending_count: %d\n"
 		"fallback_events: %d\n"
 		"pair_events: %d\n"
-		"unpair_events: %d\n",
+		"unpair_events: %d\n"
+		"helper_rx_kern_crypto: %d\n",
 		grp->state,
 		grp->state == COOP_STATE_DISABLED ? "DISABLED" :
 		grp->state == COOP_STATE_IDLE ? "IDLE" :
@@ -1356,7 +1638,8 @@ static int coop_rx_format_stats(char *buf, size_t size,
 		atomic_read(&grp->pending_count),
 		atomic_read(&grp->stats.fallback_events),
 		atomic_read(&grp->stats.pair_events),
-		atomic_read(&grp->stats.unpair_events));
+		atomic_read(&grp->stats.unpair_events),
+		atomic_read(&grp->stats.helper_rx_kern_crypto));
 }
 
 static ssize_t coop_rx_show_stats(struct device *dev,
