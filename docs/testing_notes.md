@@ -174,6 +174,35 @@ Each helper independently contributes frames — the primary's reorder
 window and PN replay check handle dedup across all helpers naturally.
 Stats are aggregated across all helpers (not per-helper).
 
+## Helper Hot-Replug
+
+When a helper USB adapter is physically disconnected:
+- `rtw_coop_rx_remove_adapter()` fires from the USB disconnect path
+- The helper is cleanly removed from the group
+- If it was the last helper, state falls back to IDLE
+- The primary continues operating normally (no crash, no stall)
+- A `fallback_events` counter increments
+
+When the helper is plugged back in:
+- The driver re-enumerates the USB device and creates a new interface
+- The helper is NOT automatically re-paired (by design — avoids races)
+- To rejoin, re-pair and re-bind manually:
+
+```bash
+# On systems with NetworkManager:
+nmcli device set <helper> managed no
+
+# Re-bind (helper is still in the pair list if not explicitly unpaired):
+echo 1 > /sys/class/net/<primary>/coop_rx/coop_rx_bind
+```
+
+Note: after USB replug, NetworkManager will re-manage the new interface
+and may interfere. The `nmcli managed no` step is required on desktop
+systems. On embedded targets without NM, only the bind step is needed.
+
+A monitoring script for automatic helper rejoin is a future enhancement
+(not yet implemented).
+
 ## Architecture
 
 ```
