@@ -228,4 +228,8 @@ echo "  Monitor:  sudo python3 $(cd "$(dirname "$0")" && pwd)/coop-rx-monitor.py
 echo "  Test:     sudo $(cd "$(dirname "$0")" && pwd)/coop-rx-test.sh"
 echo "  Stop:     sudo $(cd "$(dirname "$0")" && pwd)/coop-rx-stop.sh"
 echo ""
+echo "  Rejoin helper after USB replug:"
+echo "    nmcli device set <helper> managed no"
+echo "    echo 1 > /sys/class/net/$PRIMARY/coop_rx/coop_rx_bind"
+echo ""
 echo "  For AP mode, see: coop-rx-ap-test-start.sh"
