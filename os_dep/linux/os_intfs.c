@@ -181,6 +181,11 @@ extern int rtw_cooperative_rx;
 module_param(rtw_cooperative_rx, int, 0644);
 MODULE_PARM_DESC(rtw_cooperative_rx, "Enable cooperative RX diversity with helper adapters (0=off, 1=on)");
 
+extern int rtw_coop_rx_drop_primary;
+module_param(rtw_coop_rx_drop_primary, int, 0644);
+MODULE_PARM_DESC(rtw_coop_rx_drop_primary,
+	"Debug: drop primary RX data frames when cooperative RX active (0=off, 1=on)");
+
 /* set log level when inserting driver module, default log level is _DRV_INFO_ = 4,
 * please refer to "How_to_set_driver_debug_log_level.doc" to set the available level.
 */

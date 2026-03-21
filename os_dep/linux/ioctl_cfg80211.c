@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #ifdef CONFIG_IOCTL_CFG80211
 
@@ -3152,6 +3153,14 @@ static int cfg80211_rtw_scan(struct wiphy *wiphy
 #ifdef CONFIG_P2P
 	pwdinfo = &(padapter->wdinfo);
 #endif /* CONFIG_P2P */
+
+	/* Cooperative RX: reject scans on helper adapters — scanning
+	 * hops channels and pulls the helper off its bound channel. */
+	if (rtw_coop_rx_is_helper(padapter)) {
+		need_indicate_scan_done = _TRUE;
+		ret = 0;
+		goto check_need_indicate_scan_done;
+	}
 
 	RTW_INFO(FUNC_ADPT_FMT"%s\n", FUNC_ADPT_ARG(padapter)
 		, wdev == wiphy_to_pd_wdev(wiphy) ? " PD" : "");

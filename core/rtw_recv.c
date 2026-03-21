@@ -4861,8 +4861,12 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 		goto exit;
 	}
 
-	/* Debug: drop primary RX data frames to test helper-only path */
+	/* Debug: drop primary RX data frames to test helper-only path.
+	 * Only fires on the primary adapter when cooperative RX is active;
+	 * helpers must not have their frames dropped by this knob. */
 	if (unlikely(READ_ONCE(rtw_coop_rx_drop_primary)) &&
+	    rtw_coop_rx_active() &&
+	    !rtw_coop_rx_is_helper(primary_padapter) &&
 	    GetFrameType(pbuf) == WIFI_DATA_TYPE) {
 		rtw_free_recvframe(precvframe,
 				   &primary_padapter->recvpriv.free_recv_queue);
