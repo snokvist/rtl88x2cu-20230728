@@ -321,6 +321,8 @@ def draw(stdscr):
             if iface and iface in cur_net and iface in prev_net and dt > 0:
                 rx_bps = (cur_net[iface]["rx_bytes"] - prev_net[iface]["rx_bytes"]) * 8 / dt
                 rates[f"{iface}_rx_bps"] = ema(rates.get(f"{iface}_rx_bps"), rx_bps)
+                rx_pps = (cur_net[iface]["rx_packets"] - prev_net[iface]["rx_packets"]) / dt
+                rates[f"{iface}_rx_pps"] = ema(rates.get(f"{iface}_rx_pps"), rx_pps)
 
         prev_stats = stats
         prev_time = now
@@ -439,7 +441,7 @@ def draw(stdscr):
                         curses.color_pair(1))
         row += 2
 
-        # === Throughput ===
+        # === Throughput (3-way split) ===
         safe_addstr(stdscr, row, 2, "Throughput", BOLD | curses.color_pair(4))
         safe_addstr(stdscr, row, 50, "rate", DIM)
         safe_addstr(stdscr, row, 63, "total", DIM)
@@ -447,16 +449,45 @@ def draw(stdscr):
 
         if primary and primary in cur_net:
             rx_b = cur_net[primary]["rx_bytes"]
-            rx_rate = rates.get(f"{primary}_rx_bps", 0)
-            safe_addstr(stdscr, row, 3, "Primary stack RX")
+            total_bps = rates.get(f"{primary}_rx_bps", 0)
+            total_pps = rates.get(f"{primary}_rx_pps", 0)
+            helper_pps = rates.get("helper_rx_accepted", 0)
+
+            # Split: primary_radio = total - helper contribution
+            if total_pps > 0 and helper_pps >= 0:
+                helper_frac = min(helper_pps / total_pps, 1.0) if total_pps > 1 else 0
+                primary_frac = 1.0 - helper_frac
+            else:
+                helper_frac = 0
+                primary_frac = 1.0
+
+            primary_bps = total_bps * primary_frac
+            helper_bps = total_bps * helper_frac
+
+            # Total output
+            safe_addstr(stdscr, row, 3, "Total output (to stack)")
             safe_addstr(stdscr, row, 46,
-                        f"{fmt_rate(rx_rate):>10s}", BOLD | curses.color_pair(2))
+                        f"{fmt_rate(total_bps):>10s}", BOLD | curses.color_pair(2))
             safe_addstr(stdscr, row, 59,
                         f"{fmt_bytes(rx_b):>10s}")
             row += 1
-            safe_addstr(stdscr, row, 3,
-                        "(primary radio + helper injected frames)",
-                        DIM | curses.color_pair(5))
+
+            # Primary radio contribution
+            pc = 2 if primary_frac > 0.5 else (3 if primary_frac > 0.1 else 1)
+            pct_str = f"({primary_frac*100:.0f}%)" if total_pps > 1 else ""
+            safe_addstr(stdscr, row, 3, f"  Primary radio {pct_str}")
+            safe_addstr(stdscr, row, 46,
+                        f"{fmt_rate(primary_bps):>10s}",
+                        curses.color_pair(pc))
+            row += 1
+
+            # Helper contribution
+            hc = 2 if helper_frac > 0 else 5
+            hpct_str = f"({helper_frac*100:.0f}%)" if total_pps > 1 else ""
+            safe_addstr(stdscr, row, 3, f"  Helper injected {hpct_str}")
+            safe_addstr(stdscr, row, 46,
+                        f"{fmt_rate(helper_bps):>10s}",
+                        curses.color_pair(hc))
             row += 2
 
         # === Helper RX Pipeline ===
