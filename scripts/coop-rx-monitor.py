@@ -442,6 +442,13 @@ def draw(stdscr):
         row += 2
 
         # === Throughput (3-way split) ===
+        #
+        # Kernel rx_packets includes management/beacon frames, so we
+        # can't use it directly for the data-frame split. Instead:
+        # - Helper data rate: helper_rx_accepted/sec × avg_frame_bytes
+        #   (avg_frame_bytes = stack rx_bytes/rx_packets)
+        # - Primary data rate: total stack rate - helper data rate
+        # - Total: stack rx_bytes rate (ground truth)
         safe_addstr(stdscr, row, 2, "Throughput", BOLD | curses.color_pair(4))
         safe_addstr(stdscr, row, 50, "rate", DIM)
         safe_addstr(stdscr, row, 63, "total", DIM)
@@ -451,18 +458,27 @@ def draw(stdscr):
             rx_b = cur_net[primary]["rx_bytes"]
             total_bps = rates.get(f"{primary}_rx_bps", 0)
             total_pps = rates.get(f"{primary}_rx_pps", 0)
-            helper_pps = rates.get("helper_rx_accepted", 0)
+            helper_fps = rates.get("helper_rx_accepted", 0)
 
-            # Split: primary_radio = total - helper contribution
-            if total_pps > 0 and helper_pps >= 0:
-                helper_frac = min(helper_pps / total_pps, 1.0) if total_pps > 1 else 0
-                primary_frac = 1.0 - helper_frac
+            # Estimate avg frame size from stack counters
+            avg_frame_bytes = 0
+            if total_pps > 1:
+                avg_frame_bytes = (total_bps / 8) / total_pps  # bytes/pkt
+
+            # Helper bitrate = accepted frames/sec × avg frame size × 8
+            helper_bps = helper_fps * avg_frame_bytes * 8 if avg_frame_bytes > 0 else 0
+            # Clamp: helper can't exceed total
+            helper_bps = min(helper_bps, total_bps)
+            # Primary = remainder
+            primary_bps = max(total_bps - helper_bps, 0)
+
+            # Percentages
+            if total_bps > 100:
+                helper_frac = helper_bps / total_bps
+                primary_frac = primary_bps / total_bps
             else:
                 helper_frac = 0
                 primary_frac = 1.0
-
-            primary_bps = total_bps * primary_frac
-            helper_bps = total_bps * helper_frac
 
             # Total output
             safe_addstr(stdscr, row, 3, "Total output (to stack)")
@@ -474,7 +490,7 @@ def draw(stdscr):
 
             # Primary radio contribution
             pc = 2 if primary_frac > 0.5 else (3 if primary_frac > 0.1 else 1)
-            pct_str = f"({primary_frac*100:.0f}%)" if total_pps > 1 else ""
+            pct_str = f"({primary_frac*100:.0f}%)" if total_bps > 100 else ""
             safe_addstr(stdscr, row, 3, f"  Primary radio {pct_str}")
             safe_addstr(stdscr, row, 46,
                         f"{fmt_rate(primary_bps):>10s}",
@@ -482,8 +498,8 @@ def draw(stdscr):
             row += 1
 
             # Helper contribution
-            hc = 2 if helper_frac > 0 else 5
-            hpct_str = f"({helper_frac*100:.0f}%)" if total_pps > 1 else ""
+            hc = 2 if helper_frac > 0.01 else 5
+            hpct_str = f"({helper_frac*100:.0f}%)" if total_bps > 100 else ""
             safe_addstr(stdscr, row, 3, f"  Helper injected {hpct_str}")
             safe_addstr(stdscr, row, 46,
                         f"{fmt_rate(helper_bps):>10s}",
