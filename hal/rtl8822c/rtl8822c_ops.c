@@ -1457,12 +1457,10 @@ void rtw_hw_client_port_clr(_adapter *adapter)
 
 static void hw_var_set_opmode(PADAPTER adapter, u8 mode)
 {
-	static u8 isMonitor = _FALSE;
-
-	if (isMonitor == _TRUE) {
 #ifdef CONFIG_WIFI_MONITOR
-		struct mon_reg_backup *backup = &GET_HAL_DATA(adapter)->mon_backup;
+	struct mon_reg_backup *backup = &GET_HAL_DATA(adapter)->mon_backup;
 
+	if (backup->is_monitor) {
 		if (backup->known_rcr) {
 			backup->known_rcr = 0;
 			rtw_hal_set_hwreg(adapter, HW_VAR_RCR, (u8 *)&backup->rcr);
@@ -1482,17 +1480,17 @@ static void hw_var_set_opmode(PADAPTER adapter, u8 mode)
 			rtw_write16(adapter, REG_RXFLTMAP1_8822C, backup->rxfilter1);
 			rtw_write16(adapter, REG_RXFLTMAP2_8822C, backup->rxfilter2);
 		}
-#endif /* CONFIG_WIFI_MONITOR */
-		isMonitor = _FALSE;
+		backup->is_monitor = 0;
 	}
 
 	if (mode == _HW_STATE_MONITOR_) {
-		isMonitor = _TRUE;
+		backup->is_monitor = 1;
 
 		Set_MSR(adapter, _HW_STATE_NOLINK_);
 		set_opmode_monitor(adapter);
 		return;
 	}
+#endif /* CONFIG_WIFI_MONITOR */
 
 	/* clear crc bit */
 	if (rtw_hal_rcr_check(adapter, BIT_ACRC32_8822C))

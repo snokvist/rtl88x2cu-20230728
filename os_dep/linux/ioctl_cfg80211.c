@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #ifdef CONFIG_IOCTL_CFG80211
 
@@ -3153,6 +3154,14 @@ static int cfg80211_rtw_scan(struct wiphy *wiphy
 	pwdinfo = &(padapter->wdinfo);
 #endif /* CONFIG_P2P */
 
+	/* Cooperative RX: reject scans on helper adapters — scanning
+	 * hops channels and pulls the helper off its bound channel. */
+	if (rtw_coop_rx_is_helper(padapter)) {
+		need_indicate_scan_done = _TRUE;
+		ret = 0;
+		goto check_need_indicate_scan_done;
+	}
+
 	RTW_INFO(FUNC_ADPT_FMT"%s\n", FUNC_ADPT_ARG(padapter)
 		, wdev == wiphy_to_pd_wdev(wiphy) ? " PD" : "");
 
@@ -4647,12 +4656,12 @@ static int cfg80211_rtw_get_txpower(struct wiphy *wiphy,
 	if (wdev && wdev_to_ndev(wdev)) {
 		_adapter *adapter = (_adapter *)rtw_netdev_priv(wdev_to_ndev(wdev));
 		mbm = rtw_adapter_get_oper_txpwr_max_mbm(adapter, 1);
-		RTW_INFO(FUNC_ADPT_FMT" total max: %d mbm\n", FUNC_ADPT_ARG(adapter), mbm);
+		RTW_DBG(FUNC_ADPT_FMT" total max: %d mbm\n", FUNC_ADPT_ARG(adapter), mbm);
 	} else
 #endif
 	{
 		mbm = rtw_get_oper_txpwr_max_mbm(dvobj, 1);
-		RTW_INFO(FUNC_WIPHY_FMT" total max: %d mbm\n", FUNC_WIPHY_ARG(wiphy), mbm);
+		RTW_DBG(FUNC_WIPHY_FMT" total max: %d mbm\n", FUNC_WIPHY_ARG(wiphy), mbm);
 	}
 
 	*dbm = mbm / MBM_PDBM;
@@ -6972,7 +6981,7 @@ static int cfg80211_rtw_get_channel(struct wiphy *wiphy,
 
 	if (MLME_IS_ASOC(padapter)) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 2)) || defined(CONFIG_MLD_KERNEL_PATCH)
-	RTW_INFO(FUNC_ADPT_FMT" link_id:%d\n", FUNC_ADPT_ARG(padapter), link_id);
+	RTW_DBG(FUNC_ADPT_FMT" link_id:%d\n", FUNC_ADPT_ARG(padapter), link_id);
 #endif
 #ifdef CONFIG_80211N_HT
 		ht_option = padapter->mlmepriv.htpriv.ht_option;

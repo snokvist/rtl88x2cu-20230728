@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #ifdef CONFIG_NEW_SIGNAL_STAT_PROCESS
 static void rtw_signal_stat_timer_hdl(void *ctx);
@@ -3321,7 +3322,7 @@ move_to_next:
 	return ret;
 }
 
-static int recv_process_mpdu(_adapter *padapter, union recv_frame *prframe)
+int recv_process_mpdu(_adapter *padapter, union recv_frame *prframe)
 {
 	_queue *pfree_recv_queue = &padapter->recvpriv.free_recv_queue;
 	struct rx_pkt_attrib *pattrib = &prframe->u.hdr.attrib;
@@ -3695,7 +3696,7 @@ static int recv_indicatepkts_in_order(_adapter *padapter, struct recv_reorder_ct
 
 }
 
-static int recv_indicatepkt_reorder(_adapter *padapter, union recv_frame *prframe)
+int recv_indicatepkt_reorder(_adapter *padapter, union recv_frame *prframe)
 {
 	_irqL irql;
 	struct rx_pkt_attrib *pattrib = &prframe->u.hdr.attrib;
@@ -4340,7 +4341,7 @@ int recv_func(_adapter *padapter, union recv_frame *rframe)
 	u8 type;
 #endif
 
-	if (check_fwstate(mlmepriv, WIFI_MONITOR_STATE) 
+	if (check_fwstate(mlmepriv, WIFI_MONITOR_STATE)
 #ifdef RTW_SIMPLE_CONFIG
 		|| (check_fwstate(mlmepriv, WIFI_AP_STATE) && padapter->rtw_simple_config == _TRUE && IS_MCAST(get_ra(ptr)))
 #endif
@@ -4852,6 +4853,26 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 	bool phy_queried = 0;
 	_adapter *primary_padapter = precvframe->u.hdr.adapter;
 	_adapter *iface = NULL;
+
+	/* Cooperative RX: redirect helper data frames to primary's RX path */
+	if (rtw_coop_rx_pre_recv_entry(precvframe, primary_padapter,
+				       pbuf, pphy_status) == RTW_RX_HANDLED) {
+		ret = _SUCCESS;
+		goto exit;
+	}
+
+	/* Debug: drop primary RX data frames to test helper-only path.
+	 * Only fires on the primary adapter when cooperative RX is active;
+	 * helpers must not have their frames dropped by this knob. */
+	if (unlikely(READ_ONCE(rtw_coop_rx_drop_primary)) &&
+	    rtw_coop_rx_active() &&
+	    !rtw_coop_rx_is_helper(primary_padapter) &&
+	    GetFrameType(pbuf) == WIFI_DATA_TYPE) {
+		rtw_free_recvframe(precvframe,
+				   &primary_padapter->recvpriv.free_recv_queue);
+		ret = _SUCCESS;
+		goto exit;
+	}
 
 #ifdef CONFIG_MP_INCLUDED
 	if (rtw_mp_mode_check(primary_padapter))

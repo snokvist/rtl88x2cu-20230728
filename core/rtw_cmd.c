@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #ifndef DBG_CMD_EXECUTE
 	#define DBG_CMD_EXECUTE 0
@@ -3638,6 +3639,8 @@ void rtw_dfs_ch_switch_hdl(struct dvobj_priv *dvobj)
 		/* update union ch/bw/offset for STA only */
 		rtw_mi_update_union_chan_inf(pri_adapter, req_ch, req_offset, req_bw);
 		rtw_rfctl_update_op_mode(rfctl, 0, 0, 0);
+		/* Move cooperative RX helpers to the new channel */
+		rtw_coop_rx_notify_channel_switch(pri_adapter);
 	}
 
 	/* make asoc STA ifaces disconnect */
