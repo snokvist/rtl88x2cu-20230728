@@ -120,8 +120,14 @@ struct cooperative_rx_group {
 	_queue pending_queue;		/* validated frames awaiting processing */
 	_tasklet coop_rx_tasklet;	/* drains pending_queue */
 	atomic_t pending_count;		/* backpressure gauge */
-#define COOP_PENDING_MAX	128	/* drop threshold */
-#define COOP_BATCH_SIZE		32	/* frames per tasklet run */
+	/*
+	 * Tuning constants. PENDING_MAX must leave enough headroom in
+	 * the primary's 256-frame pool (NR_RECVFRAME) for its USB recv
+	 * pipeline. With drop_primary=1, all traffic goes through the
+	 * pending queue, so this is the binding constraint.
+	 */
+#define COOP_PENDING_MAX	48	/* drop threshold (was 128) */
+#define COOP_BATCH_SIZE		64	/* frames per tasklet run (was 32) */
 
 	/* Statistics */
 	struct coop_rx_stats stats;
