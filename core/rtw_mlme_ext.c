@@ -14867,6 +14867,11 @@ u8 setkey_hdl(_adapter *padapter, u8 *pbuf)
 	write_cam(padapter, cam_id, ctrl, addr, pparm->key,
 		pparm->algorithm & _SEC_TYPE_256_);
 
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
+	/* Update helper's CAM mirror with new GTK after rekey */
+	rtw_coop_rx_notify_gtk_rekey(padapter);
+#endif
+
 	/* if ((cam_id > 3) && (((pmlmeinfo->state&0x03) == WIFI_FW_AP_STATE) || ((pmlmeinfo->state&0x03) == WIFI_FW_ADHOC_STATE)))*/
 #ifndef SEC_DEFAULT_KEY_SEARCH
 	if (((pmlmeinfo->state & 0x03) == WIFI_FW_AP_STATE) || ((pmlmeinfo->state & 0x03) == WIFI_FW_ADHOC_STATE)) {

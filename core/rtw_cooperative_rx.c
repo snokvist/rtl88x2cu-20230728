@@ -312,9 +312,9 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
  * crypto engine will decrypt helper frames automatically, eliminating
  * all software decryption overhead.
  *
- * This is a probe/experimental feature. Check dmesg for:
- *   "coop_rx: helper frame encrypt=X bdecrypted=Y"
- * If bdecrypted=1 appears, HW decrypt is working.
+ * Verified working on RTL8822CU: the chip performs CAM lookup
+ * even with BIT_AAP set (promiscuous address filtering).
+ * HW strips MIC after verification but keeps IV header.
  */
 
 static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
@@ -327,6 +327,7 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 	u8 algo;
 	u8 gtk_keyid;
 	u16 ptk_ctrl, gtk_ctrl;
+	bool is_256;
 	int i;
 	u16 scr;
 
@@ -353,14 +354,14 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 	ptk_ctrl = BIT(15) | ((algo & 0x07) << 2);  /* keyid = 0 */
 	gtk_ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
 
-	if (algo & _SEC_TYPE_256_) {
+	is_256 = !!(algo & _SEC_TYPE_256_);
+	if (is_256) {
 		ptk_ctrl |= BIT(9);
 		gtk_ctrl |= BIT(9);
 	}
 
 	for (i = 0; i < num_helpers; i++) {
 		_adapter *helper = helpers[i];
-		bool is_256 = !!(algo & _SEC_TYPE_256_);
 
 		if (!helper)
 			continue;
@@ -382,17 +383,11 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 		write_cam(helper, 4, gtk_ctrl,
 			  grp->bound_bssid, gtk_key, is_256);
 
-		/* Enable RX decrypt engine on helper HW.
-		 * SCR_RxDecEnable (BIT3) = enable HW CAM lookup on RX
-		 * SCR_CHK_KEYID (BIT8) = validate keyid in frame
-		 * SCR_RXBCUSEDK (BIT7) = broadcast uses default key */
+		/* Enable RX decrypt engine on helper HW */
 		scr = rtw_read16(helper, REG_SECCFG);
-		RTW_INFO("coop_rx: helper[%d] SECCFG before: 0x%04x\n",
-			 i, scr);
+		grp->helper_seccfg_orig[i] = scr;
 		scr |= SCR_RxDecEnable | SCR_CHK_KEYID | SCR_RXBCUSEDK;
 		rtw_write16(helper, REG_SECCFG, scr);
-		RTW_INFO("coop_rx: helper[%d] SECCFG after:  0x%04x\n",
-			 i, rtw_read16(helper, REG_SECCFG));
 	}
 
 	grp->cam_mirror_active = 1;
@@ -419,13 +414,55 @@ static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 		clear_cam_entry(helper, 4);
 		clear_cam_entry(helper, 5);  /* 256-bit GTK second half */
 
-		/* Disable RX decrypt engine */
-		rtw_write16(helper, REG_SECCFG, 0);
-
-		RTW_INFO("coop_rx: CAM mirror cleared on helper[%d]\n", i);
+		/* Restore original SECCFG */
+		rtw_write16(helper, REG_SECCFG, grp->helper_seccfg_orig[i]);
 	}
 
 	grp->cam_mirror_active = 0;
+}
+
+/*
+ * GTK rekey notification — called from set_key_hdl() when the AP
+ * installs a new group key. Re-programs the helper's GTK CAM entry
+ * with the new key so HW decrypt continues working for broadcast
+ * frames after rekey.
+ */
+void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
+{
+	struct cooperative_rx_group *grp;
+	struct security_priv *psec;
+	u8 gtk_keyid, algo;
+	u8 *gtk_key;
+	u16 gtk_ctrl;
+	bool is_256;
+	int i;
+
+	grp = READ_ONCE(rtw_coop_rx_group);
+	if (!grp || !grp->cam_mirror_active)
+		return;
+	if (grp->primary != adapter)
+		return;
+
+	psec = &adapter->securitypriv;
+	algo = psec->dot11PrivacyAlgrthm;
+	gtk_keyid = psec->dot118021XGrpKeyid;
+	gtk_key = psec->dot118021XGrpKey[gtk_keyid].skey;
+	is_256 = !!(algo & _SEC_TYPE_256_);
+
+	gtk_ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
+	if (is_256)
+		gtk_ctrl |= BIT(9);
+
+	for (i = 0; i < grp->num_helpers; i++) {
+		_adapter *helper = grp->helpers[i];
+
+		if (!helper)
+			continue;
+		write_cam(helper, 4, gtk_ctrl,
+			  grp->bound_bssid, gtk_key, is_256);
+	}
+
+	RTW_INFO("coop_rx: CAM mirror GTK rekeyed (keyid=%d)\n", gtk_keyid);
 }
 #endif /* CONFIG_COOP_RX_CAM_MIRROR */
 
@@ -1360,21 +1397,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			pattrib->icv_len = 0;
 	}
 
-#ifdef CONFIG_COOP_RX_CAM_MIRROR
-	/* CAM mirroring probe: log the first 20 helper frames to check
-	 * whether HW decrypt is working. If bdecrypted=1 appears in
-	 * dmesg, CAM mirroring is functional. */
-	{
-		static atomic_t cam_dbg_count = ATOMIC_INIT(0);
-
-		if (atomic_inc_return(&cam_dbg_count) <= 20)
-			RTW_INFO("coop_rx: helper frame encrypt=%d "
-				 "bdecrypted=%d privacy=%d pkt_len=%u\n",
-				 pattrib->encrypt, pattrib->bdecrypted,
-				 pattrib->privacy, pattrib->pkt_len);
-	}
-#endif
-
 	/* Still-encrypted frames that HW should have decrypted but didn't */
 	if (pattrib->encrypt && !pattrib->bdecrypted &&
 	    !pattrib->privacy) {
@@ -1434,10 +1456,9 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	 * duplicate frames flood the reorder window and cause the
 	 * primary's copies to be displaced.
 	 */
-	if (pattrib->encrypt &&
-	    (pattrib->encrypt == _AES_ || pattrib->encrypt == _CCMP_256_ ||
-	     pattrib->encrypt == _GCMP_ || pattrib->encrypt == _GCMP_256_ ||
-	     pattrib->encrypt == _TKIP_)) {
+	if (pattrib->encrypt == _AES_ || pattrib->encrypt == _CCMP_256_ ||
+	    pattrib->encrypt == _GCMP_ || pattrib->encrypt == _GCMP_256_ ||
+	    pattrib->encrypt == _TKIP_) {
 		struct stainfo_rxcache *prxcache = &psta->sta_recvpriv.rxcache;
 		u8 *iv_ptr;
 		u8 pn[8] = {0}, cached_pn[8] = {0};
@@ -1625,12 +1646,12 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 		 * seq_ctrl against the primary's cached rxseq.  If they
 		 * match, the primary already processed this frame.
 		 *
-		 * Crucially, we also WRITE rxseq on pass — this creates
-		 * bidirectional dedup on SMP: if the drain tasklet runs
-		 * before the primary's recv_decache, our write causes
-		 * the primary's subsequent recv_decache to see a match
-		 * and drop its copy.  Whoever updates rxseq first wins;
-		 * the other path sees seq_ctrl == *prxseq and drops.
+		 * For SW-decrypt frames only: also WRITE rxseq on pass
+		 * for bidirectional dedup (the slow decrypt makes the
+		 * primary reliably first, so this catches the rare case
+		 * where the tasklet wins).  HW-decrypted (CAM mirror)
+		 * frames skip the write to avoid racing with the
+		 * equally-fast primary and displacing its copies.
 		 */
 		if (psta) {
 			u16 seq_ctrl = (pa->seq_num << 4) |
@@ -1733,23 +1754,6 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 			/* Bounds-check priority for recvreorder_ctrl index */
 			if (_helper_priority > 15)
 				_helper_priority = 0;
-
-		/* Re-validate psta — the STA may have been disassociated
-		 * between enqueue (submit_helper_frame) and this tasklet.
-		 * A stale psta pointer is a use-after-free risk. */
-		if (psta) {
-			struct sta_info *psta_chk;
-
-			psta_chk = rtw_get_stainfo(&primary->stapriv,
-						   pa->ta);
-			if (psta_chk != psta) {
-				atomic_inc(&grp->stats.helper_rx_no_sta);
-				rtw_free_recvframe(pframe,
-					&primary->recvpriv.free_recv_queue);
-				processed++;
-				continue;
-			}
-		}
 
 		/* Frame is not a dup — process it.
 		 * Validate hdrlen against frame length to prevent

@@ -124,6 +124,7 @@ struct cooperative_rx_group {
 	 * primary's keys for zero-cost HW decrypt on helper frames.
 	 * Set during bind_session, cleared during unbind/deinit. */
 	u8 cam_mirror_active;
+	u16 helper_seccfg_orig[COOP_MAX_HELPERS]; /* saved SECCFG */
 #endif
 
 	/* Deferred processing: helper enqueues, drain tasklet processes */
@@ -164,6 +165,7 @@ int rtw_coop_rx_bind_session(_adapter *primary);
 void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
+void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter);
 
 /* Drain tasklet for deferred helper frame processing */
 #include <linux/version.h>
