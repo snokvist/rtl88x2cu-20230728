@@ -178,11 +178,11 @@ module_param(rtw_dynamic_agg_enable, int, 0644);
 
 /* Cooperative RX diversity: 0=disabled (default), 1=enabled */
 extern int rtw_cooperative_rx;
-module_param(rtw_cooperative_rx, int, 0644);
+module_param(rtw_cooperative_rx, int, 0444);
 MODULE_PARM_DESC(rtw_cooperative_rx, "Enable cooperative RX diversity with helper adapters (0=off, 1=on)");
 
 extern int rtw_coop_rx_drop_primary;
-module_param(rtw_coop_rx_drop_primary, int, 0644);
+module_param(rtw_coop_rx_drop_primary, int, 0600);
 MODULE_PARM_DESC(rtw_coop_rx_drop_primary,
 	"Debug: drop primary RX data frames when cooperative RX active (0=off, 1=on)");
 
