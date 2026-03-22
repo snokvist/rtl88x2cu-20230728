@@ -1342,12 +1342,20 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		/* Case (b): encrypt!=0 && bdecrypted==1 from HW CAM.
 		 * Keep encrypt and bdecrypted as-is from descriptor. */
 
-		/* Always set IV/ICV lengths from the encrypt type.
-		 * Needed for wlanhdr_to_ethhdr() IV stripping even
-		 * after HW decrypt (HW decrypts payload but IV header
-		 * remains in the frame). */
+		/* Set IV/ICV lengths from the encrypt type.
+		 * IV header remains in the frame after both HW and SW
+		 * decrypt — wlanhdr_to_ethhdr() needs iv_len to skip it.
+		 *
+		 * ICV/MIC handling differs by decrypt method:
+		 * - SW decrypt (bdecrypted=0): MIC still in frame,
+		 *   will be verified+stripped by decryptor()
+		 * - HW decrypt (bdecrypted=1): RTL8822C strips MIC
+		 *   after verification. Setting icv_len=0 prevents
+		 *   wlanhdr_to_ethhdr() from trimming valid payload. */
 		SET_ICE_IV_LEN(pattrib->iv_len, pattrib->icv_len,
 			       pattrib->encrypt);
+		if (pattrib->bdecrypted)
+			pattrib->icv_len = 0;
 	}
 
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
