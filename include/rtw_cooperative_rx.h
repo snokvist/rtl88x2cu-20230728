@@ -115,6 +115,8 @@ struct cooperative_rx_group {
 	struct crypto_aead *tfm_ccm;	/* ccm(aes) for CCMP-128 */
 	struct crypto_aead *tfm_ccm_256;/* ccm(aes) for CCMP-256 */
 	struct crypto_aead *tfm_gcm;	/* gcm(aes) for GCMP-128/256 */
+	u8 cached_key[32];		/* last key set on transforms */
+	u8 cached_key_len;		/* length of cached_key (16 or 32) */
 #endif
 
 	/* Deferred processing: helper enqueues, drain tasklet processes */
@@ -157,7 +159,10 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
 
 /* Drain tasklet for deferred helper frame processing */
-void rtw_coop_rx_drain_tasklet(unsigned long data);
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0))
+void rtw_coop_rx_drain_tasklet(struct tasklet_struct *t);
+#endif
 
 /* Helper RX hot path — single entry point for pre_recv_entry() hook */
 int rtw_coop_rx_pre_recv_entry(union recv_frame *precvframe,

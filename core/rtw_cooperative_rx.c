@@ -30,6 +30,7 @@
 #include <rtw_recv.h>
 #include <rtw_cooperative_rx.h>
 #include <linux/rtnetlink.h>
+#include <linux/version.h>
 #include <net/net_namespace.h>
 
 #ifdef CONFIG_DEBUG_FS
@@ -217,14 +218,15 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 
 	/* Set key only when it changes — crypto_aead_setkey triggers a
 	 * full key schedule expansion each time, which is expensive.
-	 * The transform caches the last key internally, but we avoid
-	 * the call overhead entirely for consecutive same-key frames
-	 * (which is >99% of traffic in a single-STA session).
-	 * Note: single-tasklet serialization guarantees no concurrent
-	 * setkey calls on the same transform. */
-	ret = crypto_aead_setkey(tfm, key, key_len);
-	if (ret)
-		return _FAIL;
+	 * Single-tasklet serialization guarantees no concurrent setkey. */
+	if (key_len != grp->cached_key_len ||
+	    memcmp(key, grp->cached_key, key_len) != 0) {
+		ret = crypto_aead_setkey(tfm, key, key_len);
+		if (ret)
+			return _FAIL;
+		memcpy(grp->cached_key, key, key_len);
+		grp->cached_key_len = key_len;
+	}
 
 	frame_data = pframe->u.hdr.rx_data;
 	hdrlen = pa->hdrlen;
@@ -327,8 +329,12 @@ int rtw_coop_rx_init(void)
 	/* Init deferred processing queue and tasklet */
 	_rtw_init_queue(&grp->pending_queue);
 	atomic_set(&grp->pending_count, 0);
-	tasklet_init(&grp->coop_rx_tasklet, rtw_coop_rx_drain_tasklet,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0))
+	tasklet_setup(&grp->coop_rx_tasklet, rtw_coop_rx_drain_tasklet);
+#else
+	tasklet_init(&grp->coop_rx_tasklet, rtw_coop_rx_drain_tasklet_compat,
 		     (unsigned long)grp);
+#endif
 
 	/* Publish the group pointer */
 	smp_wmb();
@@ -371,9 +377,16 @@ void rtw_coop_rx_deinit(void)
 
 		while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
 			atomic_dec(&grp->pending_count);
-			if (primary)
+			if (primary) {
 				rtw_free_recvframe(pframe,
 					&primary->recvpriv.free_recv_queue);
+			} else {
+				/* Primary gone — free skb directly to avoid leak */
+				if (pframe->u.hdr.pkt) {
+					dev_kfree_skb_any(pframe->u.hdr.pkt);
+					pframe->u.hdr.pkt = NULL;
+				}
+			}
 		}
 	}
 
@@ -689,13 +702,8 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 	if (grp->num_helpers > 0)
 		grp->state = COOP_STATE_ACTIVE;
 
-#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
-	coop_rx_crypto_init(grp);
-#endif
-
 	/* Snapshot helpers under lock, then release before calling
-	 * rtw_setopmode_cmd (which sleeps). After release, the live
-	 * helpers[] array may change, but our snapshot is safe. */
+	 * functions that may sleep (crypto_alloc_aead, rtw_setopmode_cmd). */
 	{
 		_adapter *helper_snap[COOP_MAX_HELPERS];
 		int snap_count = grp->num_helpers;
@@ -705,6 +713,12 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 			helper_snap[i] = grp->helpers[i];
 
 		spin_unlock_irqrestore(&grp->lock, flags);
+
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+		/* Allocate crypto transforms in process context (may sleep).
+		 * Must be done AFTER releasing the spinlock. */
+		coop_rx_crypto_init(grp);
+#endif
 
 		for (i = 0; i < snap_count; i++) {
 			if (helper_snap[i])
@@ -748,19 +762,21 @@ int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel)
 	 * radio doesn't receive any frames. Safe to call if already UP. */
 	if (!(ndev->flags & IFF_UP)) {
 		rtnl_lock();
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0))
 		dev_open(ndev, NULL);
+#else
+		dev_open(ndev);
+#endif
 		rtnl_unlock();
 	}
 
-	/* Set netdev type for radiotap headers */
+	/* Set netdev type and cfg80211 wdev type under rtnl_lock to
+	 * prevent races with rtnetlink queries and cfg80211. */
+	rtnl_lock();
 	ndev->type = ARPHRD_IEEE80211_RADIOTAP;
-
-	/* Update cfg80211 wdev type so iw/NM report "monitor" correctly.
-	 * Note: on systems with NetworkManager, userspace should run
-	 * `nmcli dev set <helper> managed no` before binding to prevent
-	 * NM from interfering. The coop-rx-start.sh script handles this. */
 	if (helper->rtw_wdev)
 		helper->rtw_wdev->iftype = NL80211_IFTYPE_MONITOR;
+	rtnl_unlock();
 
 	/* Set driver internal mode — configures WIFI_MONITOR_STATE,
 	 * sets RCR to promiscuous, opens RX filter maps */
@@ -867,28 +883,37 @@ void rtw_coop_rx_unbind_session(void)
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
 	coop_rx_crypto_deinit(grp);
 #endif
-	{
-		union recv_frame *pframe;
-		_adapter *primary = grp->primary;
-
-		while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
-			atomic_dec(&grp->pending_count);
-			if (primary)
-				rtw_free_recvframe(pframe,
-					&primary->recvpriv.free_recv_queue);
-		}
-	}
-	tasklet_enable(&grp->coop_rx_tasklet);
-
+	/* Set state first so submit_helper_frame() rejects new frames
+	 * during the drain window (fixes orphaned frame race). */
 	spin_lock_irqsave(&grp->lock, flags);
 	if (grp->state == COOP_STATE_ACTIVE ||
 	    grp->state == COOP_STATE_BINDING) {
 		grp->state = grp->primary ? COOP_STATE_IDLE : COOP_STATE_DISABLED;
 		memset(grp->bound_bssid, 0, ETH_ALEN);
 		grp->bound_channel = 0;
-		RTW_INFO("%s: session unbound\n", __func__);
 	}
 	spin_unlock_irqrestore(&grp->lock, flags);
+
+	{
+		union recv_frame *pframe;
+		_adapter *primary = grp->primary;
+
+		while ((pframe = rtw_alloc_recvframe(&grp->pending_queue)) != NULL) {
+			atomic_dec(&grp->pending_count);
+			if (primary) {
+				rtw_free_recvframe(pframe,
+					&primary->recvpriv.free_recv_queue);
+			} else {
+				if (pframe->u.hdr.pkt) {
+					dev_kfree_skb_any(pframe->u.hdr.pkt);
+					pframe->u.hdr.pkt = NULL;
+				}
+			}
+		}
+	}
+	tasklet_enable(&grp->coop_rx_tasklet);
+
+	RTW_INFO("%s: session unbound\n", __func__);
 }
 
 /*
@@ -1309,16 +1334,19 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	 * from the primary's recv path, avoiding contention that
 	 * caused 60-86% packet loss on the primary at high rates.
 	 */
-	if (atomic_read(&grp->pending_count) >= COOP_PENDING_MAX) {
+	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
+	if (atomic_inc_return(&grp->pending_count) > COOP_PENDING_MAX) {
+		/* Over limit — dequeue and drop. atomic_inc_return makes
+		 * the check-and-increment atomic, preventing burst overrun. */
+		pframe_primary = rtw_alloc_recvframe(&grp->pending_queue);
+		atomic_dec(&grp->pending_count);
 		atomic_inc(&grp->stats.helper_rx_backpressure);
-		rtw_free_recvframe(pframe_primary,
-				   &primary->recvpriv.free_recv_queue);
+		if (pframe_primary)
+			rtw_free_recvframe(pframe_primary,
+					   &primary->recvpriv.free_recv_queue);
 		rcu_read_unlock();
 		return RTW_RX_HANDLED;
 	}
-
-	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
-	atomic_inc(&grp->pending_count);
 	atomic_inc(&grp->stats.helper_rx_deferred);
 	tasklet_schedule(&grp->coop_rx_tasklet);
 
@@ -1336,9 +1364,23 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
  * USB recv_tasklet, eliminating contention on the primary's
  * recv path that caused packet loss at high frame rates.
  */
-void rtw_coop_rx_drain_tasklet(unsigned long data)
+static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp);
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0))
+void rtw_coop_rx_drain_tasklet(struct tasklet_struct *t)
 {
-	struct cooperative_rx_group *grp = (struct cooperative_rx_group *)data;
+	struct cooperative_rx_group *grp = from_tasklet(grp, t, coop_rx_tasklet);
+	_coop_rx_drain_tasklet(grp);
+}
+#else
+static void rtw_coop_rx_drain_tasklet_compat(unsigned long data)
+{
+	_coop_rx_drain_tasklet((struct cooperative_rx_group *)data);
+}
+#endif
+
+static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
+{
 	_adapter *primary;
 	union recv_frame *pframe;
 	int processed = 0;
@@ -1493,8 +1535,21 @@ void rtw_coop_rx_drain_tasklet(unsigned long data)
 
 				ret = coop_rx_kernel_decrypt(grp, primary,
 							     pframe);
-				if (ret == _SUCCESS)
+				if (ret == _SUCCESS) {
+					/* Update PN cache so primary's
+					 * recv_decache sees this PN as
+					 * consumed — prevents replay. */
+					u8 ptid = pa->priority;
+
+					if (ptid > 15)
+						ptid = 0;
+					if (psta) {
+						struct stainfo_rxcache *pc =
+							&psta->sta_recvpriv.rxcache;
+						_rtw_memcpy(pc->iv[ptid], iv, 8);
+					}
 					goto coop_post_decrypt;
+				}
 				/* Fall through to SW path on failure */
 			}
 #endif
@@ -1956,7 +2011,7 @@ static ssize_t coop_rx_show_info(struct device *dev,
 	return len;
 }
 
-static DEVICE_ATTR(coop_rx_enabled, 0644,
+static DEVICE_ATTR(coop_rx_enabled, 0600,
 		   coop_rx_show_enabled, coop_rx_store_enabled);
 static DEVICE_ATTR(coop_rx_role, 0444, coop_rx_show_role, NULL);
 static DEVICE_ATTR(coop_rx_stats, 0444, coop_rx_show_stats, NULL);
@@ -1965,7 +2020,7 @@ static DEVICE_ATTR(coop_rx_pair, 0200, NULL, coop_rx_store_pair);
 static DEVICE_ATTR(coop_rx_unpair, 0200, NULL, coop_rx_store_unpair);
 static DEVICE_ATTR(coop_rx_bind, 0200, NULL, coop_rx_store_bind);
 static DEVICE_ATTR(coop_rx_reset_stats, 0200, NULL, coop_rx_store_reset_stats);
-static DEVICE_ATTR(coop_rx_drop_primary, 0644,
+static DEVICE_ATTR(coop_rx_drop_primary, 0600,
 		   coop_rx_show_drop_primary, coop_rx_store_drop_primary);
 static DEVICE_ATTR(coop_rx_auto_pair, 0200, NULL, coop_rx_store_auto_pair);
 
