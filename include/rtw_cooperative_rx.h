@@ -119,6 +119,13 @@ struct cooperative_rx_group {
 	u8 cached_key_len;		/* length of cached_key (16 or 32) */
 #endif
 
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
+	/* CAM mirroring: program helper's HW crypto engine with
+	 * primary's keys for zero-cost HW decrypt on helper frames.
+	 * Set during bind_session, cleared during unbind/deinit. */
+	u8 cam_mirror_active;
+#endif
+
 	/* Deferred processing: helper enqueues, drain tasklet processes */
 	_queue pending_queue;		/* validated frames awaiting processing */
 	_tasklet coop_rx_tasklet;	/* drains pending_queue */
