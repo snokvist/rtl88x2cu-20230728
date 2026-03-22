@@ -327,7 +327,6 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 	u8 algo;
 	u8 gtk_keyid;
 	u16 ptk_ctrl, gtk_ctrl;
-	u8 bcast_addr[ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 	int i;
 	u16 scr;
 
@@ -376,9 +375,12 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 		write_cam(helper, 0, ptk_ctrl,
 			  grp->bound_bssid, ptk_key, is_256);
 
-		/* Program GTK entry (CAM slot 4): MAC = broadcast */
+		/* Program GTK entry (CAM slot 4): MAC = AP BSSID.
+		 * RTL8822C CAM matches by A2 (TA), which is the AP's
+		 * BSSID even for broadcast/multicast frames. The driver's
+		 * own set_key_hdl uses get_bssid() for group RX CAM. */
 		write_cam(helper, 4, gtk_ctrl,
-			  bcast_addr, gtk_key, is_256);
+			  grp->bound_bssid, gtk_key, is_256);
 
 		/* Enable RX decrypt engine on helper HW.
 		 * SCR_RxDecEnable (BIT3) = enable HW CAM lookup on RX
