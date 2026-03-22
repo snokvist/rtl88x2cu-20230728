@@ -354,25 +354,31 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 	ptk_ctrl = BIT(15) | ((algo & 0x07) << 2);  /* keyid = 0 */
 	gtk_ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
 
-	if (algo & _SEC_TYPE_256_)
+	if (algo & _SEC_TYPE_256_) {
 		ptk_ctrl |= BIT(9);
+		gtk_ctrl |= BIT(9);
+	}
 
 	for (i = 0; i < num_helpers; i++) {
 		_adapter *helper = helpers[i];
+		bool is_256 = !!(algo & _SEC_TYPE_256_);
 
 		if (!helper)
 			continue;
 
 		RTW_INFO("coop_rx: CAM mirror — programming helper[%d] "
-			 "iface_id=%d\n", i, helper->iface_id);
+			 "iface_id=%d algo=%d is_256=%d\n",
+			 i, helper->iface_id, algo, is_256);
 
-		/* Program PTK entry (CAM slot 0): MAC = AP BSSID */
-		rtw_sec_write_cam_ent(helper, 0, ptk_ctrl,
-				      grp->bound_bssid, ptk_key);
+		/* Program PTK entry (CAM slot 0): MAC = AP BSSID.
+		 * Use write_cam() not rtw_sec_write_cam_ent() to
+		 * handle 256-bit key split across two CAM entries. */
+		write_cam(helper, 0, ptk_ctrl,
+			  grp->bound_bssid, ptk_key, is_256);
 
 		/* Program GTK entry (CAM slot 4): MAC = broadcast */
-		rtw_sec_write_cam_ent(helper, 4, gtk_ctrl,
-				      bcast_addr, gtk_key);
+		write_cam(helper, 4, gtk_ctrl,
+			  bcast_addr, gtk_key, is_256);
 
 		/* Enable RX decrypt engine on helper HW.
 		 * SCR_RxDecEnable (BIT3) = enable HW CAM lookup on RX
@@ -405,9 +411,11 @@ static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 		if (!helper)
 			continue;
 
-		/* Clear CAM entries */
-		rtw_sec_clr_cam_ent(helper, 0);
-		rtw_sec_clr_cam_ent(helper, 4);
+		/* Clear CAM entries (both 128-bit and 256-bit slots) */
+		clear_cam_entry(helper, 0);
+		clear_cam_entry(helper, 1);  /* 256-bit PTK second half */
+		clear_cam_entry(helper, 4);
+		clear_cam_entry(helper, 5);  /* 256-bit GTK second half */
 
 		/* Disable RX decrypt engine */
 		rtw_write16(helper, REG_SECCFG, 0);
@@ -1295,32 +1303,51 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	/*
 	 * Fix up encryption fields for monitor-mode helper frames.
 	 *
-	 * In monitor mode the RX descriptor reports encrypt=0 even for
-	 * encrypted frames (HW CAM lookup is bypassed). Detect encryption
-	 * from the 802.11 Protected Frame bit (pattrib->privacy) and
-	 * populate encrypt/iv_len/icv_len from the primary's security
-	 * context. This allows the decryptor in recv_func_posthandle()
-	 * to SW-decrypt the frame using the primary's keys.
+	 * Monitor mode does not populate hdrlen/iv_len/icv_len from
+	 * the RX descriptor — these must always be set from the
+	 * primary's security context when the Protected Frame bit
+	 * (privacy) is set in the 802.11 header.
+	 *
+	 * Two cases:
+	 * (a) No CAM / CAM miss: encrypt=0, bdecrypted=0
+	 *     → populate encrypt from primary, set bdecrypted=0
+	 * (b) CAM hit (CAM mirroring): encrypt!=0, bdecrypted=1
+	 *     → keep encrypt/bdecrypted from HW, still set hdrlen etc.
 	 */
-	if (pattrib->privacy && pattrib->encrypt == 0) {
-		struct security_priv *psec = &primary->securitypriv;
+	if (pattrib->privacy) {
 		u8 a4_shift = (pattrib->to_fr_ds == 3) ? ETH_ALEN : 0;
 
-		GET_ENCRY_ALGO(psec, psta, pattrib->encrypt,
-			       IS_MCAST(pattrib->ra));
-		SET_ICE_IV_LEN(pattrib->iv_len, pattrib->icv_len,
-			       pattrib->encrypt);
-		pattrib->bdecrypted = 0;
+		/* Always set hdrlen — not populated by monitor-mode RX
+		 * descriptor parsing, needed downstream for header
+		 * stripping and IV offset calculations. */
 		pattrib->hdrlen = pattrib->qos ?
 			(WLAN_HDR_A3_QOS_LEN + a4_shift) :
 			(WLAN_HDR_A3_LEN + a4_shift);
 
-		if (pattrib->encrypt == _NO_PRIVACY_) {
-			/* Primary has no keys — can't decrypt */
-			atomic_inc(&grp->stats.helper_rx_crypto_err);
-			rcu_read_unlock();
-			return _FAIL;
+		if (pattrib->encrypt == 0) {
+			/* Case (a): HW didn't recognize encryption
+			 * (no CAM match). Populate from primary. */
+			struct security_priv *psec = &primary->securitypriv;
+
+			GET_ENCRY_ALGO(psec, psta, pattrib->encrypt,
+				       IS_MCAST(pattrib->ra));
+			pattrib->bdecrypted = 0;
+
+			if (pattrib->encrypt == _NO_PRIVACY_) {
+				atomic_inc(&grp->stats.helper_rx_crypto_err);
+				rcu_read_unlock();
+				return _FAIL;
+			}
 		}
+		/* Case (b): encrypt!=0 && bdecrypted==1 from HW CAM.
+		 * Keep encrypt and bdecrypted as-is from descriptor. */
+
+		/* Always set IV/ICV lengths from the encrypt type.
+		 * Needed for wlanhdr_to_ethhdr() IV stripping even
+		 * after HW decrypt (HW decrypts payload but IV header
+		 * remains in the frame). */
+		SET_ICE_IV_LEN(pattrib->iv_len, pattrib->icv_len,
+			       pattrib->encrypt);
 	}
 
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
@@ -1397,6 +1424,9 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	     pattrib->encrypt == _TKIP_)) {
 		struct stainfo_rxcache *prxcache = &psta->sta_recvpriv.rxcache;
 		u8 *iv_ptr;
+		u8 pn[8] = {0}, cached_pn[8] = {0};
+		u64 pkt_pn, curr_pn;
+		u8 tid = pattrib->qos ? pattrib->priority : 0;
 
 		/* Bounds check: ensure frame is large enough for hdr + IV.
 		 * Prevents buffer over-read on truncated/malformed frames. */
@@ -1406,9 +1436,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			return _FAIL;
 		}
 		iv_ptr = precvframe->u.hdr.rx_data + pattrib->hdrlen;
-		u8 pn[8] = {0}, cached_pn[8] = {0};
-		u64 pkt_pn, curr_pn;
-		u8 tid = pattrib->qos ? pattrib->priority : 0;
 
 		if (tid <= 15) {
 			rtw_iv_to_pn(iv_ptr, pn, NULL, pattrib->encrypt);
