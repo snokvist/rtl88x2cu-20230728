@@ -1412,13 +1412,19 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	}
 
 	/*
-	 * Pre-decrypt PN replay check: extract the packet number from
-	 * the CCMP/GCMP IV header and compare against the primary's
+	 * PN replay check: extract the packet number from the
+	 * CCMP/GCMP IV header and compare against the primary's
 	 * stored PN. If the PN is stale (already consumed by the
-	 * primary's own copy), skip the frame entirely — avoids the
-	 * expensive AES decrypt operation on known duplicates.
+	 * primary's own copy), skip the frame entirely.
+	 *
+	 * This runs for BOTH SW-decrypt (bdecrypted=0) and HW-decrypt
+	 * (bdecrypted=1, CAM mirror) frames. HW decrypt does NOT strip
+	 * the IV header, so the PN is still readable. For HW-decrypted
+	 * frames this is the PRIMARY dedup mechanism — without it,
+	 * duplicate frames flood the reorder window and cause the
+	 * primary's copies to be displaced.
 	 */
-	if (pattrib->encrypt && !pattrib->bdecrypted &&
+	if (pattrib->encrypt &&
 	    (pattrib->encrypt == _AES_ || pattrib->encrypt == _CCMP_256_ ||
 	     pattrib->encrypt == _GCMP_ || pattrib->encrypt == _GCMP_256_ ||
 	     pattrib->encrypt == _TKIP_)) {
@@ -1652,16 +1658,21 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 			/* Claim this frame — primary's recv_decache
 			 * will see our write and drop its copy.
 			 *
-			 * Race note: there is a narrow window where both
-			 * the primary's recv_decache and this tasklet read
-			 * the old *prxseq, both pass, and both deliver.
-			 * This mirrors the driver's own recv_decache which
-			 * is also non-atomic (read-then-write without lock).
-			 * For encrypted frames, CCMP PN replay check
-			 * provides a second dedup layer. For non-QoS
-			 * unencrypted frames, higher-layer dedup (IP/TCP)
-			 * handles the rare duplicate. */
-			WRITE_ONCE(*prxseq, seq_ctrl);
+			 * IMPORTANT: only write rxseq for SW-decrypt
+			 * frames. HW-decrypted (CAM mirror) frames
+			 * are fast enough to race with the primary's
+			 * recv_decache. Writing rxseq here would cause
+			 * the primary to drop its copy, and if the
+			 * helper's copy is then rejected by the reorder
+			 * window, BOTH copies are lost.
+			 *
+			 * For SW-decrypt frames, the drain tasklet is
+			 * slower (decrypt overhead), so the primary
+			 * usually processes first. The write provides
+			 * bidirectional dedup for the rare case where
+			 * the tasklet wins. */
+			if (!pa->bdecrypted)
+				WRITE_ONCE(*prxseq, seq_ctrl);
 		}
 
 		/*
