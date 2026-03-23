@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 struct mlme_handler mlme_sta_tbl[] = {
 	{WIFI_ASSOCREQ,		"OnAssocReq",	&OnAssocReq},
@@ -15848,7 +15849,10 @@ u8 rtw_set_chbw_hdl(_adapter *padapter, u8 *pbuf)
 	rtw_mi_get_ch_setting_union(padapter, &u_ch, &u_bw, &u_offset);
 	rtw_mi_update_union_chan_inf(padapter, u_ch, u_offset, u_bw);
 	rtw_rfctl_update_op_mode(dvobj_to_rfctl(dvobj), 0, 0, 0);
-	
+
+	/* Move cooperative RX helpers to the new channel */
+	rtw_coop_rx_notify_channel_switch(padapter);
+
 	return	H2C_SUCCESS;
 }
 

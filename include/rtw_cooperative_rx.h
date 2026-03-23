@@ -186,25 +186,8 @@ static inline bool rtw_coop_rx_active(void)
 
 static inline bool rtw_coop_rx_is_helper(_adapter *adapter)
 {
-	struct cooperative_rx_group *grp;
-	int i, n;
-
-	if (!rtw_coop_rx_enabled())
-		return false;
-	grp = READ_ONCE(rtw_coop_rx_group);
-	if (!grp || READ_ONCE(grp->state) < COOP_STATE_BINDING)
-		return false;
-	/* Clamp to array bounds: num_helpers can shrink concurrently
-	 * (helper removal shifts the array), so a stale read must
-	 * never index past COOP_MAX_HELPERS. */
-	n = READ_ONCE(grp->num_helpers);
-	if (n > COOP_MAX_HELPERS)
-		n = COOP_MAX_HELPERS;
-	for (i = 0; i < n; i++) {
-		if (READ_ONCE(grp->helpers[i]) == adapter)
-			return true;
-	}
-	return false;
+	/* O(1) check using cached per-adapter flag set by add/remove_helper */
+	return READ_ONCE(adapter->is_coop_helper);
 }
 
 /* sysfs / proc interface */
