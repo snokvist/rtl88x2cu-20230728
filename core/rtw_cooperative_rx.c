@@ -1057,15 +1057,14 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			   &helper_adapter->recvpriv.free_recv_queue);
 
 	/*
-	 * Deferred processing: enqueue to pending_queue and schedule
-	 * the drain tasklet. This decouples the helper's softirq
-	 * from the primary's recv path, avoiding contention that
-	 * caused 60-86% packet loss on the primary at high rates.
+	 * Deferred processing via drain tasklet. Even for open networks,
+	 * inline processing in the helper's USB softirq causes contention
+	 * with the primary's recv path (recv_decache race). The tasklet
+	 * runs in its own softirq, which is scheduled immediately via
+	 * tasklet_hi_schedule for minimal latency.
 	 */
 	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
 	if (atomic_inc_return(&grp->pending_count) > coop_pending_max(grp)) {
-		/* Over limit -- dequeue and drop. atomic_inc_return makes
-		 * the check-and-increment atomic, preventing burst overrun. */
 		pframe_primary = rtw_alloc_recvframe(&grp->pending_queue);
 		atomic_dec(&grp->pending_count);
 		atomic_inc(&grp->stats.helper_rx_backpressure);
@@ -1076,7 +1075,9 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		return RTW_RX_HANDLED;
 	}
 	atomic_inc(&grp->stats.helper_rx_deferred);
-	tasklet_schedule(&grp->coop_rx_tasklet);
+	/* Use tasklet_hi_schedule for higher priority than normal tasklets,
+	 * reducing scheduling latency vs standard tasklet_schedule. */
+	tasklet_hi_schedule(&grp->coop_rx_tasklet);
 
 	rcu_read_unlock();
 	return RTW_RX_HANDLED;
@@ -1191,9 +1192,11 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				continue;
 			}
 
-			/* Claim this frame -- write rxseq so primary's
-			 * recv_decache sees it as consumed. */
-			WRITE_ONCE(*prxseq, seq_ctrl);
+			/* Do NOT write *prxseq here. Let recv_func_posthandle's
+			 * internal recv_decache handle the claim. Writing here
+			 * causes the primary's recv_decache to drop ALL its
+			 * frames (including ping replies) since the helper's
+			 * tasklet consistently wins the race. */
 		}
 
 		/*
