@@ -2067,14 +2067,14 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		     sizeof(struct rx_pkt_attrib));
 	pframe_primary->u.hdr.len = precvframe->u.hdr.len;
 
-	/* Derive rx pointers from the SKB itself rather than copying
-	 * from the source frame. This ensures they remain valid even
-	 * if the SKB buffer is reallocated (pskb_expand_head, etc.)
-	 * between enqueue and drain. */
-	pframe_primary->u.hdr.rx_head = pframe_primary->u.hdr.pkt->head;
-	pframe_primary->u.hdr.rx_data = pframe_primary->u.hdr.pkt->data;
-	pframe_primary->u.hdr.rx_tail = skb_tail_pointer(pframe_primary->u.hdr.pkt);
-	pframe_primary->u.hdr.rx_end = skb_end_pointer(pframe_primary->u.hdr.pkt);
+	/* Copy rx pointers from the source (helper) frame. These point
+	 * into the transferred SKB's data buffer at the correct offsets
+	 * for the parsed 802.11 header. The SKB ownership has been
+	 * transferred (pkt pointer swap above), so these remain valid. */
+	pframe_primary->u.hdr.rx_head = precvframe->u.hdr.rx_head;
+	pframe_primary->u.hdr.rx_data = precvframe->u.hdr.rx_data;
+	pframe_primary->u.hdr.rx_tail = precvframe->u.hdr.rx_tail;
+	pframe_primary->u.hdr.rx_end = precvframe->u.hdr.rx_end;
 
 	/*
 	 * Strip FCS from monitor-mode helper frames.
@@ -2327,19 +2327,8 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				_helper_priority = 0;
 
 		/* Frame is not a dup — process it.
-		 *
-		 * ALL frames go through recv_func_posthandle() which handles:
-		 *   bdecrypted=0: decrypt (SW) + strip IV/MIC + defrag + reorder
-		 *   bdecrypted=1: strip IV/MIC only + defrag + reorder
-		 *
-		 * CAM-mirror HW-decrypted frames arrive with bdecrypted=1 but
-		 * still need IV/MIC stripping — skipping recv_func_posthandle
-		 * would deliver frames with extra bytes to the network stack.
-		 *
-		 * For SW-encrypted frames, try kernel crypto first for speed;
-		 * on success set bdecrypted=1 and fall through to posthandle
-		 * which will strip IV/MIC without re-decrypting.
-		 */
+		 * Validate hdrlen against frame length to prevent
+		 * buffer over-read in decrypt or IV extraction. */
 		if (pa->encrypt && !pa->bdecrypted) {
 			if (pa->hdrlen > pframe->u.hdr.len ||
 			    pframe->u.hdr.len < pa->hdrlen + pa->iv_len) {
@@ -2350,10 +2339,7 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				continue;
 			}
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
-			/* Try kernel crypto first (HW-accelerated).
-			 * On success, bdecrypted is set to 1 by
-			 * coop_rx_kernel_decrypt, so recv_func_posthandle
-			 * will skip decrypt and just strip IV/MIC. */
+			/* Try kernel crypto first (HW-accelerated) */
 			if (pa->encrypt == _AES_ ||
 			    pa->encrypt == _CCMP_256_ ||
 			    pa->encrypt == _GCMP_ ||
@@ -2377,19 +2363,25 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 							&psta->sta_recvpriv.rxcache;
 						_rtw_memcpy(pc->iv[ptid], iv, 8);
 					}
-					/* Fall through to recv_func_posthandle
-					 * with bdecrypted=1 for IV/MIC strip */
+					goto coop_post_decrypt;
 				}
-				/* Fall through to posthandle on failure too —
-				 * it will attempt SW decrypt */
+				/* Fall through to SW path on failure */
 			}
 #endif
+			ret = recv_func_posthandle(primary, pframe);
+		} else {
+#ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
+		coop_post_decrypt:
+#endif
+			if (pa->qos) {
+				if (psta)
+					pframe->u.hdr.preorder_ctrl =
+						&psta->recvreorder_ctrl[_helper_priority];
+				ret = recv_indicatepkt_reorder(primary, pframe);
+			} else {
+				ret = recv_process_mpdu(primary, pframe);
+			}
 		}
-		/* Route through recv_func_posthandle for all frames:
-		 * - encrypt && !bdecrypted: SW decrypt + strip
-		 * - encrypt && bdecrypted (CAM/kernel crypto): strip IV/MIC only
-		 * - !encrypt: passthrough (no-op decrypt, defrag, reorder) */
-		ret = recv_func_posthandle(primary, pframe);
 
 		/*
 		 * After this point, pframe/pa/psta may be freed.
