@@ -168,6 +168,7 @@ static void coop_rx_crypto_deinit(struct cooperative_rx_group *grp)
 	 * would skip setkey (key matches cache) but the fresh
 	 * transform has no key schedule loaded → decrypt fails. */
 	grp->cached_key_len = 0;
+	grp->cached_tfm = NULL;
 	memset(grp->cached_key, 0, sizeof(grp->cached_key));
 
 	if (grp->tfm_ccm) {
@@ -259,14 +260,19 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 
 	/* Set key only when it changes — crypto_aead_setkey triggers a
 	 * full key schedule expansion each time, which is expensive.
-	 * Single-tasklet serialization guarantees no concurrent setkey. */
-	if (key_len != grp->cached_key_len ||
+	 * Single-tasklet serialization guarantees no concurrent setkey.
+	 * Cache includes transform pointer: different cipher suites
+	 * (CCMP vs GCMP) use different transforms, each needing its
+	 * own setkey even if the raw key bytes match. */
+	if (tfm != grp->cached_tfm ||
+	    key_len != grp->cached_key_len ||
 	    memcmp(key, grp->cached_key, key_len) != 0) {
 		ret = crypto_aead_setkey(tfm, key, key_len);
 		if (ret)
 			return _FAIL;
 		memcpy(grp->cached_key, key, key_len);
 		grp->cached_key_len = key_len;
+		grp->cached_tfm = tfm;
 	}
 
 	frame_data = pframe->u.hdr.rx_data;
@@ -318,7 +324,8 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	 * The kernel AEAD decrypt reads ciphertext+MIC from src SG,
 	 * writes plaintext to dst SG (we use same buffer = in-place). */
 	if (aad_len > sizeof(__aad_buf)) {
-		aead_request_free(req);
+		if (req != grp->prealloc_req)
+			aead_request_free(req);
 		return _FAIL;
 	}
 	memcpy(__aad_buf, aad, aad_len);

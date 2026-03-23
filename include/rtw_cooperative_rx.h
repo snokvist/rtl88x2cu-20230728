@@ -119,6 +119,7 @@ struct cooperative_rx_group {
 	struct crypto_aead *tfm_gcm;	/* gcm(aes) for GCMP-128/256 */
 	u8 cached_key[32];		/* last key set on transforms */
 	u8 cached_key_len;		/* length of cached_key (16 or 32) */
+	struct crypto_aead *cached_tfm;	/* which transform was keyed */
 	/* Pre-allocated AEAD request — avoids GFP_ATOMIC alloc/free
 	 * per frame in the drain tasklet. Sized for the largest
 	 * transform's reqsize. Only accessed from drain tasklet
