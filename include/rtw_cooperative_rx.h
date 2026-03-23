@@ -117,9 +117,19 @@ struct cooperative_rx_group {
 	struct crypto_aead *tfm_ccm;	/* ccm(aes) for CCMP-128 */
 	struct crypto_aead *tfm_ccm_256;/* ccm(aes) for CCMP-256 */
 	struct crypto_aead *tfm_gcm;	/* gcm(aes) for GCMP-128/256 */
-	u8 cached_key[32];		/* last key set on transforms */
-	u8 cached_key_len;		/* length of cached_key (16 or 32) */
-	struct crypto_aead *cached_tfm;	/* which transform was keyed */
+	/* Key caches — avoid redundant crypto_aead_setkey() calls.
+	 * Group key: single-slot (all STAs share GTK).
+	 * Pairwise key: tracked by STA MAC to handle AP mode where
+	 * different STAs have different PTKs. Without per-STA tracking,
+	 * interleaved frames from N STAs would thrash the cache. */
+	u8 cached_gtk[32];		/* last group key set */
+	u8 cached_gtk_len;
+	struct crypto_aead *cached_gtk_tfm;
+
+	u8 cached_ptk[32];		/* last pairwise key set */
+	u8 cached_ptk_len;
+	struct crypto_aead *cached_ptk_tfm;
+	u8 cached_ptk_ta[ETH_ALEN];	/* STA whose PTK is cached */
 	/* Pre-allocated AEAD request — avoids GFP_ATOMIC alloc/free
 	 * per frame in the drain tasklet. Sized for the largest
 	 * transform's reqsize. Only accessed from drain tasklet

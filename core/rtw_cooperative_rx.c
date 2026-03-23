@@ -167,9 +167,13 @@ static void coop_rx_crypto_deinit(struct cooperative_rx_group *grp)
 	 * new transforms. Without this, a rebind to the same AP
 	 * would skip setkey (key matches cache) but the fresh
 	 * transform has no key schedule loaded → decrypt fails. */
-	grp->cached_key_len = 0;
-	grp->cached_tfm = NULL;
-	memset(grp->cached_key, 0, sizeof(grp->cached_key));
+	grp->cached_gtk_len = 0;
+	grp->cached_gtk_tfm = NULL;
+	memset(grp->cached_gtk, 0, sizeof(grp->cached_gtk));
+	grp->cached_ptk_len = 0;
+	grp->cached_ptk_tfm = NULL;
+	memset(grp->cached_ptk, 0, sizeof(grp->cached_ptk));
+	memset(grp->cached_ptk_ta, 0, sizeof(grp->cached_ptk_ta));
 
 	if (grp->tfm_ccm) {
 		crypto_free_aead(grp->tfm_ccm);
@@ -261,18 +265,34 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	/* Set key only when it changes — crypto_aead_setkey triggers a
 	 * full key schedule expansion each time, which is expensive.
 	 * Single-tasklet serialization guarantees no concurrent setkey.
-	 * Cache includes transform pointer: different cipher suites
-	 * (CCMP vs GCMP) use different transforms, each needing its
-	 * own setkey even if the raw key bytes match. */
-	if (tfm != grp->cached_tfm ||
-	    key_len != grp->cached_key_len ||
-	    memcmp(key, grp->cached_key, key_len) != 0) {
-		ret = crypto_aead_setkey(tfm, key, key_len);
-		if (ret)
-			return _FAIL;
-		memcpy(grp->cached_key, key, key_len);
-		grp->cached_key_len = key_len;
-		grp->cached_tfm = tfm;
+	 *
+	 * Split cache: group key (single-slot, all STAs share GTK)
+	 * vs pairwise key (tracked by STA MAC for AP mode where
+	 * different STAs have different PTKs). */
+	if (IS_MCAST(pa->ra)) {
+		if (tfm != grp->cached_gtk_tfm ||
+		    key_len != grp->cached_gtk_len ||
+		    memcmp(key, grp->cached_gtk, key_len) != 0) {
+			ret = crypto_aead_setkey(tfm, key, key_len);
+			if (ret)
+				return _FAIL;
+			memcpy(grp->cached_gtk, key, key_len);
+			grp->cached_gtk_len = key_len;
+			grp->cached_gtk_tfm = tfm;
+		}
+	} else {
+		if (tfm != grp->cached_ptk_tfm ||
+		    key_len != grp->cached_ptk_len ||
+		    memcmp(psta->hwaddr, grp->cached_ptk_ta, ETH_ALEN) != 0 ||
+		    memcmp(key, grp->cached_ptk, key_len) != 0) {
+			ret = crypto_aead_setkey(tfm, key, key_len);
+			if (ret)
+				return _FAIL;
+			memcpy(grp->cached_ptk, key, key_len);
+			grp->cached_ptk_len = key_len;
+			grp->cached_ptk_tfm = tfm;
+			memcpy(grp->cached_ptk_ta, psta->hwaddr, ETH_ALEN);
+		}
 	}
 
 	frame_data = pframe->u.hdr.rx_data;
