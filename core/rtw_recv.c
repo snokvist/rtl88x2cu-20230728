@@ -4854,25 +4854,16 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 	_adapter *primary_padapter = precvframe->u.hdr.adapter;
 	_adapter *iface = NULL;
 
-#ifdef CONFIG_MP_INCLUDED
-	if (rtw_mp_mode_check(primary_padapter))
-		goto query_phy_status;
-#endif
-#ifdef CONFIG_WIFI_MONITOR
-	if (MLME_IS_MONITOR(primary_padapter))
-		goto query_phy_status;
-#endif
-
-	/* Cooperative RX: redirect helper data frames to primary's RX path */
+	/* Cooperative RX: redirect helper data frames to primary's RX path.
+	 * Must be checked BEFORE the monitor-mode early exit, because
+	 * helpers ARE in monitor mode but their frames need processing. */
 	if (rtw_coop_rx_pre_recv_entry(precvframe, primary_padapter,
 				       pbuf, pphy_status) == RTW_RX_HANDLED) {
 		ret = _SUCCESS;
 		goto exit;
 	}
 
-	/* Debug: drop primary RX data frames to test helper-only path.
-	 * Only fires on the primary adapter when cooperative RX is active;
-	 * helpers have their frames redirected above. */
+	/* Debug: drop primary RX data frames to test helper-only path. */
 	if (READ_ONCE(rtw_coop_rx_drop_primary) &&
 	    rtw_coop_rx_active() &&
 	    !rtw_coop_rx_is_helper(primary_padapter) &&
@@ -4882,6 +4873,15 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 		ret = _SUCCESS;
 		goto exit;
 	}
+
+#ifdef CONFIG_MP_INCLUDED
+	if (rtw_mp_mode_check(primary_padapter))
+		goto query_phy_status;
+#endif
+#ifdef CONFIG_WIFI_MONITOR
+	if (MLME_IS_MONITOR(primary_padapter))
+		goto query_phy_status;
+#endif
 
 	if (ra_is_bmc == _FALSE) {
 		/* UC frame */
