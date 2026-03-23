@@ -1585,10 +1585,15 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		     &precvframe->u.hdr.attrib,
 		     sizeof(struct rx_pkt_attrib));
 	pframe_primary->u.hdr.len = precvframe->u.hdr.len;
-	pframe_primary->u.hdr.rx_head = precvframe->u.hdr.rx_head;
-	pframe_primary->u.hdr.rx_data = precvframe->u.hdr.rx_data;
-	pframe_primary->u.hdr.rx_tail = precvframe->u.hdr.rx_tail;
-	pframe_primary->u.hdr.rx_end = precvframe->u.hdr.rx_end;
+
+	/* Derive rx pointers from the SKB itself rather than copying
+	 * from the source frame. This ensures they remain valid even
+	 * if the SKB buffer is reallocated (pskb_expand_head, etc.)
+	 * between enqueue and drain. */
+	pframe_primary->u.hdr.rx_head = pframe_primary->u.hdr.pkt->head;
+	pframe_primary->u.hdr.rx_data = pframe_primary->u.hdr.pkt->data;
+	pframe_primary->u.hdr.rx_tail = skb_tail_pointer(pframe_primary->u.hdr.pkt);
+	pframe_primary->u.hdr.rx_end = skb_end_pointer(pframe_primary->u.hdr.pkt);
 
 	/*
 	 * Strip FCS from monitor-mode helper frames.
@@ -1716,7 +1721,15 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 		atomic_dec(&grp->pending_count);
 
 		pa = &pframe->u.hdr.attrib;
-		psta = pframe->u.hdr.psta;
+
+		/* Re-validate psta via fresh lookup rather than trusting
+		 * the pointer stored during submit_helper_frame().  Between
+		 * enqueue and drain (or across RCU gap re-acquires), the
+		 * STA may have disassociated and its sta_info freed.  A
+		 * fresh lookup under the current RCU read-side section
+		 * guarantees the returned pointer is live. */
+		psta = rtw_get_stainfo(&primary->stapriv, pa->ta);
+		pframe->u.hdr.psta = psta;
 
 		/*
 		 * Dedup mirroring recv_decache(): compare the frame's
@@ -1911,7 +1924,12 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 
 		/* Periodically release RCU to avoid blocking grace
 		 * periods for too long (up to 64 * decrypt_time).
-		 * Re-validate primary/state after re-acquiring. */
+		 * Re-validate primary/state after re-acquiring.
+		 *
+		 * psta safety: each iteration does a fresh
+		 * rtw_get_stainfo() lookup under the current RCU
+		 * read-side section, so stale psta pointers from
+		 * a prior RCU epoch cannot be dereferenced. */
 		if (processed % COOP_RCU_BATCH == 0) {
 			rcu_read_unlock();
 			rcu_read_lock();

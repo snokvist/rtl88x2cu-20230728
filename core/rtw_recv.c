@@ -4273,8 +4273,10 @@ int recv_func_posthandle(_adapter *padapter, union recv_frame *prframe)
 	if ((_rtw_memcmp(psnap_type, SNAP_ETH_TYPE_TDLS, ETH_TYPE_LEN)) &&
 	    ((*pcategory == RTW_WLAN_CATEGORY_TDLS) || (*pcategory == RTW_WLAN_CATEGORY_P2P))) {
 		ret = OnTDLS(padapter, prframe);
-		if (ret == _FAIL)
-			goto _exit_recv_func;
+		if (ret == _FAIL) {
+			rtw_free_recvframe(orig_prframe, pfree_recv_queue);
+			goto _recv_data_drop;
+		}
 	}
 #endif /* CONFIG_TDLS */
 
