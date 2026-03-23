@@ -1003,11 +1003,10 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	pframe_primary->u.hdr.pkt = precvframe->u.hdr.pkt;
 	precvframe->u.hdr.pkt = NULL;  /* prevent double-free */
 
-	/* Copy frame metadata and mark as helper-injected */
+	/* Copy frame metadata */
 	_rtw_memcpy(&pframe_primary->u.hdr.attrib,
 		     &precvframe->u.hdr.attrib,
 		     sizeof(struct rx_pkt_attrib));
-	pframe_primary->u.hdr.attrib.coop_helper = 1;
 	pframe_primary->u.hdr.len = precvframe->u.hdr.len;
 
 	/*
@@ -1195,12 +1194,10 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				continue;
 			}
 
-			/* Claim this seq so primary's recv_decache drops its
-			 * copy. With standard tasklet_schedule (not hi), the
-			 * primary's USB recv tasklet runs first for frames it
-			 * received, so it claims prxseq first. The helper
-			 * only wins for frames the primary missed. */
-			WRITE_ONCE(*prxseq, seq_ctrl);
+			/* Do NOT write *prxseq BEFORE recv_func_posthandle.
+			 * Write it AFTER successful delivery — this way the
+			 * primary's recv_decache only drops frames that the
+			 * helper already delivered to the stack. */
 		}
 
 		/*
@@ -1241,6 +1238,9 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 			uint _helper_pktlen = 0;
 			s8 _helper_rssi;
 			u8 _helper_priority;
+			/* Save for post-delivery prxseq write */
+			u16 _saved_seq_ctrl = 0;
+			u16 *_saved_prxseq = NULL;
 
 			if (pframe->u.hdr.pkt)
 				_helper_pktlen = pframe->u.hdr.pkt->len;
@@ -1251,24 +1251,53 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 			if (_helper_priority > 15)
 				_helper_priority = 0;
 
-			/*
-			 * Route through recv_func_posthandle for proper
-			 * 802.11→ethernet conversion and reorder window
-			 * management. recv_decache inside will claim the
-			 * seq_ctrl, which means the primary's later copy
-			 * gets dropped. This is the correct behavior —
-			 * first arrival wins at the driver level.
-			 *
-			 * The rx_dropped counter may increase if both copies
-			 * reach the network stack before dedup, but the
-			 * reorder window prevents double-delivery for QoS
-			 * traffic. For non-QoS, recv_decache handles it.
-			 */
+			/* Save prxseq pointer for post-delivery write */
+			if (psta) {
+				sint _tid = pa->priority;
+				_saved_seq_ctrl = (pa->seq_num << 4) |
+						  (pa->frag_num & 0xf);
+				if (_tid > 15) _tid = 0;
+				if (pa->qos) {
+					if (IS_MCAST(pa->ra))
+						_saved_prxseq = &psta->sta_recvpriv
+							.bmc_tid_rxseq[_tid];
+					else
+						_saved_prxseq = &psta->sta_recvpriv
+							.rxcache.tid_rxseq[_tid];
+				} else {
+					if (IS_MCAST(pa->ra))
+						_saved_prxseq = &psta->sta_recvpriv
+							.nonqos_bmc_rxseq;
+					else
+						_saved_prxseq = &psta->sta_recvpriv
+							.nonqos_rxseq;
+				}
+			}
+
+			/* Insert into dedup ring BEFORE delivery so the
+			 * primary's pre_recv_entry check can catch its
+			 * duplicate even if both run concurrently. */
+			if (_saved_prxseq) {
+				u32 key = ((u32)_helper_priority << 16) |
+					  _saved_seq_ctrl;
+				u32 idx = grp->dedup_ring_idx++ &
+					  COOP_DEDUP_RING_MASK;
+				WRITE_ONCE(grp->dedup_ring[idx], key);
+			}
+
+			/* recv_func_posthandle does NOT call recv_decache
+			 * (that's in recv_func_prehandle only). */
 			ret = recv_func_posthandle(primary, pframe);
 
 			/*
 			 * After this point, pframe/pa/psta may be freed.
 			 * Use only pre-captured values (_helper_*).
+			 *
+			 * CRITICAL: Write *prxseq AFTER successful delivery.
+			 * This ensures the primary's recv_decache only drops
+			 * frames that the helper already delivered to the
+			 * stack. Writing before would block the primary from
+			 * ever delivering any frames.
 			 */
 			if (ret == _SUCCESS || ret == RTW_RX_HANDLED) {
 				s8 primary_rssi = primary->recvpriv.rssi;

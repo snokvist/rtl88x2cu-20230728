@@ -107,6 +107,15 @@ struct cooperative_rx_group {
 	/* Non-QoS dedup cache */
 	struct coop_nonqos_seq_cache nonqos_cache;
 
+	/* Post-delivery dedup ring: seq_ctrl values recently delivered
+	 * by the helper. Primary's pre_recv_entry checks this ring to
+	 * drop its duplicate copy BEFORE recv_decache runs.
+	 * Inspired by wfb-ng's nonce-set dedup approach. */
+#define COOP_DEDUP_RING_SIZE	64
+#define COOP_DEDUP_RING_MASK	(COOP_DEDUP_RING_SIZE - 1)
+	u32 dedup_ring[COOP_DEDUP_RING_SIZE]; /* (tid<<16)|seq_ctrl, 0=empty */
+	u32 dedup_ring_idx;
+
 	/* Deferred processing: helper enqueues, drain tasklet processes */
 	_queue pending_queue;		/* validated frames awaiting processing */
 	_tasklet coop_rx_tasklet;	/* drains pending_queue */
@@ -190,6 +199,29 @@ static inline bool rtw_coop_rx_is_helper(_adapter *adapter)
 {
 	/* O(1) check using cached per-adapter flag set by add/remove_helper */
 	return READ_ONCE(adapter->is_coop_helper);
+}
+
+/* Check if a frame (identified by tid + seq_ctrl) was recently
+ * delivered by the helper. Used by primary's pre_recv_entry to
+ * drop its duplicate before recv_decache. O(COOP_DEDUP_RING_SIZE). */
+static inline bool rtw_coop_rx_dedup_check(u8 tid, u16 seq_ctrl)
+{
+	struct cooperative_rx_group *grp;
+	u32 key;
+	int i;
+
+	if (!rtw_coop_rx_active())
+		return false;
+	grp = READ_ONCE(rtw_coop_rx_group);
+	if (!grp)
+		return false;
+
+	key = ((u32)tid << 16) | seq_ctrl;
+	for (i = 0; i < COOP_DEDUP_RING_SIZE; i++) {
+		if (READ_ONCE(grp->dedup_ring[i]) == key)
+			return true; /* helper already delivered this frame */
+	}
+	return false;
 }
 
 /* sysfs / proc interface */

@@ -4874,6 +4874,32 @@ s32 pre_recv_entry(union recv_frame *precvframe, u8 *pphy_status)
 		goto exit;
 	}
 
+	/* Cooperative RX dedup: if the helper already delivered this
+	 * frame, drop the primary's duplicate BEFORE recv_decache.
+	 * This prevents recv_decache's *prxseq write from being
+	 * relevant — the frame is dropped here, not in recv_decache.
+	 * Uses a ring buffer of recently-delivered (tid,seq_ctrl) pairs
+	 * populated by the drain tasklet after successful delivery. */
+	if (rtw_coop_rx_active() &&
+	    !rtw_coop_rx_is_helper(primary_padapter) &&
+	    GetFrameType(pbuf) == WIFI_DATA_TYPE) {
+		u16 sc = GetSequence(pbuf);
+		u8 fn = GetFragNum(pbuf);
+		u16 seq_ctrl = (sc << 4) | (fn & 0xf);
+		u8 tid = 0;
+		/* QoS data: subtype bit 7 is set (0x80 in frame control byte 0) */
+		u8 subtype = GetFrameType(pbuf) | (pbuf[0] & 0xf0);
+
+		if (subtype & 0x80) /* QoS data */
+			tid = pbuf[24] & 0x0f; /* QoS Control TID */
+		if (rtw_coop_rx_dedup_check(tid, seq_ctrl)) {
+			rtw_free_recvframe(precvframe,
+				&precvframe->u.hdr.adapter->recvpriv.free_recv_queue);
+			ret = _SUCCESS;
+			goto exit;
+		}
+	}
+
 #ifdef CONFIG_MP_INCLUDED
 	if (rtw_mp_mode_check(primary_padapter))
 		goto query_phy_status;
