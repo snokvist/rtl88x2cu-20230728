@@ -130,13 +130,13 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 
 		if (grp->tfm_ccm)
 			max_reqsize = max(max_reqsize,
-					  crypto_aead_reqsize(grp->tfm_ccm));
+					  (size_t)crypto_aead_reqsize(grp->tfm_ccm));
 		if (grp->tfm_ccm_256)
 			max_reqsize = max(max_reqsize,
-					  crypto_aead_reqsize(grp->tfm_ccm_256));
+					  (size_t)crypto_aead_reqsize(grp->tfm_ccm_256));
 		if (grp->tfm_gcm)
 			max_reqsize = max(max_reqsize,
-					  crypto_aead_reqsize(grp->tfm_gcm));
+					  (size_t)crypto_aead_reqsize(grp->tfm_gcm));
 
 		if (max_reqsize > 0) {
 			grp->prealloc_req = kmalloc(
@@ -290,7 +290,7 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	} else {
 		if (tfm != grp->cached_ptk_tfm ||
 		    key_len != grp->cached_ptk_len ||
-		    memcmp(psta->hwaddr, grp->cached_ptk_ta, ETH_ALEN) != 0 ||
+		    memcmp(psta->cmn.mac_addr, grp->cached_ptk_ta, ETH_ALEN) != 0 ||
 		    memcmp(key, grp->cached_ptk, key_len) != 0) {
 			ret = crypto_aead_setkey(tfm, key, key_len);
 			if (ret)
@@ -298,7 +298,7 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 			memcpy(grp->cached_ptk, key, key_len);
 			grp->cached_ptk_len = key_len;
 			grp->cached_ptk_tfm = tfm;
-			memcpy(grp->cached_ptk_ta, psta->hwaddr, ETH_ALEN);
+			memcpy(grp->cached_ptk_ta, psta->cmn.mac_addr, ETH_ALEN);
 		}
 	}
 
