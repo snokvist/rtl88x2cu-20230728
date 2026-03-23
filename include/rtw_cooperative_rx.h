@@ -34,6 +34,7 @@ struct dvobj_priv;
 struct net_device;
 union recv_frame;
 struct dentry;
+struct sta_info;
 
 #define COOP_MAX_HELPERS		4
 #define COOP_NONQOS_SEQ_CACHE_SZ	32
@@ -105,7 +106,9 @@ struct cooperative_rx_group {
 	u8 bound_channel;
 	u8 bound_bw;
 
-	/* Non-QoS dedup cache */
+	/* Non-QoS dedup cache — protected by its own lock to avoid
+	 * contention with grp->lock (membership changes) */
+	spinlock_t nonqos_lock;
 	struct coop_nonqos_seq_cache nonqos_cache;
 
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
@@ -115,16 +118,43 @@ struct cooperative_rx_group {
 	struct crypto_aead *tfm_ccm;	/* ccm(aes) for CCMP-128 */
 	struct crypto_aead *tfm_ccm_256;/* ccm(aes) for CCMP-256 */
 	struct crypto_aead *tfm_gcm;	/* gcm(aes) for GCMP-128/256 */
-	u8 cached_key[32];		/* last key set on transforms */
-	u8 cached_key_len;		/* length of cached_key (16 or 32) */
+	/* Key caches — avoid redundant crypto_aead_setkey() calls.
+	 * Group key: single-slot (all STAs share GTK).
+	 * Pairwise key: tracked by STA MAC to handle AP mode where
+	 * different STAs have different PTKs. Without per-STA tracking,
+	 * interleaved frames from N STAs would thrash the cache. */
+	u8 cached_gtk[32];		/* last group key set */
+	u8 cached_gtk_len;
+	struct crypto_aead *cached_gtk_tfm;
+
+	u8 cached_ptk[32];		/* last pairwise key set */
+	u8 cached_ptk_len;
+	struct crypto_aead *cached_ptk_tfm;
+	u8 cached_ptk_ta[ETH_ALEN];	/* STA whose PTK is cached */
+	/* Pre-allocated AEAD request — avoids GFP_ATOMIC alloc/free
+	 * per frame in the drain tasklet. Sized for the largest
+	 * transform's reqsize. Only accessed from drain tasklet
+	 * (serialized), so no locking needed. */
+	struct aead_request *prealloc_req;
 #endif
 
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
 	/* CAM mirroring: program helper's HW crypto engine with
 	 * primary's keys for zero-cost HW decrypt on helper frames.
-	 * Set during bind_session, cleared during unbind/deinit. */
+	 * Set during bind_session, cleared during unbind/deinit.
+	 *
+	 * AP mode: per-STA PTK slots are managed dynamically as
+	 * clients associate/disassociate (max COOP_CAM_AP_MAX_STAS). */
 	u8 cam_mirror_active;
+	u8 cam_is_ap;			/* operating in AP mode */
 	u16 helper_seccfg_orig[COOP_MAX_HELPERS]; /* saved SECCFG */
+
+	/* AP mode per-STA CAM tracking */
+#define COOP_CAM_AP_MAX_STAS	8
+	u8 cam_ap_sta_valid[COOP_CAM_AP_MAX_STAS];
+	u8 cam_ap_sta_mac[COOP_CAM_AP_MAX_STAS][ETH_ALEN];
+	u8 cam_ap_sta_is256[COOP_CAM_AP_MAX_STAS]; /* per-STA key width */
+	u8 cam_ap_num_stas;
 #endif
 
 	/* Deferred processing: helper enqueues, drain tasklet processes */
@@ -132,13 +162,17 @@ struct cooperative_rx_group {
 	_tasklet coop_rx_tasklet;	/* drains pending_queue */
 	atomic_t pending_count;		/* backpressure gauge */
 	/*
-	 * Tuning constants. PENDING_MAX must leave enough headroom in
-	 * the primary's 256-frame pool (NR_RECVFRAME) for its USB recv
-	 * pipeline. With drop_primary=1, all traffic goes through the
-	 * pending queue, so this is the binding constraint.
+	 * Tuning constants. PENDING_MAX scales with helper count to
+	 * absorb AMPDU bursts without backpressure drops. Must leave
+	 * headroom in the primary's 256-frame pool (NR_RECVFRAME)
+	 * for its USB recv pipeline. With 4 helpers:
+	 * 48 * (1+4) = 240, leaving 16 for primary — tight but OK
+	 * since helpers share the pool transiently.
 	 */
-#define COOP_PENDING_MAX	48	/* drop threshold (was 128) */
-#define COOP_BATCH_SIZE		64	/* frames per tasklet run (was 32) */
+#define COOP_PENDING_BASE	48	/* per-helper burst budget */
+#define coop_pending_max(grp)	(COOP_PENDING_BASE * (1 + READ_ONCE((grp)->num_helpers)))
+#define COOP_BATCH_SIZE		64	/* frames per tasklet run */
+#define COOP_RCU_BATCH		16	/* re-check RCU every N frames */
 
 	/* Statistics */
 	struct coop_rx_stats stats;
@@ -165,7 +199,11 @@ int rtw_coop_rx_bind_session(_adapter *primary);
 void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
 void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter);
+void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta);
+void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta);
+#endif
 
 /* Drain tasklet for deferred helper frame processing */
 #include <linux/version.h>
@@ -197,25 +235,7 @@ static inline bool rtw_coop_rx_active(void)
 
 static inline bool rtw_coop_rx_is_helper(_adapter *adapter)
 {
-	struct cooperative_rx_group *grp;
-	int i, n;
-
-	if (!rtw_coop_rx_enabled())
-		return false;
-	grp = READ_ONCE(rtw_coop_rx_group);
-	if (!grp || READ_ONCE(grp->state) < COOP_STATE_BINDING)
-		return false;
-	/* Clamp to array bounds: num_helpers can shrink concurrently
-	 * (helper removal shifts the array), so a stale read must
-	 * never index past COOP_MAX_HELPERS. */
-	n = READ_ONCE(grp->num_helpers);
-	if (n > COOP_MAX_HELPERS)
-		n = COOP_MAX_HELPERS;
-	for (i = 0; i < n; i++) {
-		if (READ_ONCE(grp->helpers[i]) == adapter)
-			return true;
-	}
-	return false;
+	return READ_ONCE(adapter->is_coop_helper);
 }
 
 /* sysfs / proc interface */
