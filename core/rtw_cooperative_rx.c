@@ -120,15 +120,50 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 		crypto_aead_setauthsize(grp->tfm_gcm, 16);
 	}
 
-	RTW_INFO("coop_rx: kernel crypto initialized (ccm=%s gcm=%s)\n",
+	/* Pre-allocate a single AEAD request sized for the largest
+	 * transform. This eliminates per-frame GFP_ATOMIC alloc/free
+	 * in the drain tasklet (~300-700 ns/frame saved, plus no
+	 * GFP_ATOMIC failure risk). Safe because the drain tasklet
+	 * is serialized — only one instance runs at a time. */
+	{
+		size_t max_reqsize = 0;
+
+		if (grp->tfm_ccm)
+			max_reqsize = max(max_reqsize,
+					  crypto_aead_reqsize(grp->tfm_ccm));
+		if (grp->tfm_ccm_256)
+			max_reqsize = max(max_reqsize,
+					  crypto_aead_reqsize(grp->tfm_ccm_256));
+		if (grp->tfm_gcm)
+			max_reqsize = max(max_reqsize,
+					  crypto_aead_reqsize(grp->tfm_gcm));
+
+		if (max_reqsize > 0) {
+			grp->prealloc_reqsize = max_reqsize;
+			grp->prealloc_req = kmalloc(
+				sizeof(struct aead_request) + max_reqsize,
+				GFP_KERNEL);
+			if (!grp->prealloc_req)
+				RTW_WARN("coop_rx: prealloc_req alloc failed, "
+					 "will use per-frame alloc\n");
+		}
+	}
+
+	RTW_INFO("coop_rx: kernel crypto initialized (ccm=%s gcm=%s "
+		 "prealloc=%s)\n",
 		 grp->tfm_ccm ? "yes" : "no",
-		 grp->tfm_gcm ? "yes" : "no");
+		 grp->tfm_gcm ? "yes" : "no",
+		 grp->prealloc_req ? "yes" : "no");
 
 	return 0;
 }
 
 static void coop_rx_crypto_deinit(struct cooperative_rx_group *grp)
 {
+	kfree(grp->prealloc_req);
+	grp->prealloc_req = NULL;
+	grp->prealloc_reqsize = 0;
+
 	if (grp->tfm_ccm) {
 		crypto_free_aead(grp->tfm_ccm);
 		grp->tfm_ccm = NULL;
@@ -259,10 +294,17 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 		memcpy(iv_buf + 1, nonce, 13);
 	}
 
-	/* Allocate AEAD request — flags=0: must not sleep (softirq) */
-	req = aead_request_alloc(tfm, GFP_ATOMIC);
-	if (!req)
-		return _FAIL;
+	/* Use pre-allocated AEAD request if available (eliminates
+	 * per-frame GFP_ATOMIC slab alloc/free). Falls back to
+	 * per-frame alloc if pre-alloc failed at init time. */
+	if (grp->prealloc_req) {
+		req = grp->prealloc_req;
+		aead_request_set_tfm(req, tfm);
+	} else {
+		req = aead_request_alloc(tfm, GFP_ATOMIC);
+		if (!req)
+			return _FAIL;
+	}
 
 	aead_request_set_callback(req, 0, NULL, NULL);
 
@@ -286,7 +328,8 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
 	 * final result directly (0 or error), never -EINPROGRESS.
 	 * No crypto_wait_req needed; avoids sleeping in softirq. */
 	ret = crypto_aead_decrypt(req);
-	aead_request_free(req);
+	if (req != grp->prealloc_req)
+		aead_request_free(req);
 
 	if (ret) {
 		/* MIC failure or decrypt error — fall back to SW */
@@ -493,6 +536,7 @@ int rtw_coop_rx_init(void)
 	}
 
 	spin_lock_init(&grp->lock);
+	spin_lock_init(&grp->nonqos_lock);
 	grp->state = COOP_STATE_IDLE;
 	grp->primary = NULL;
 	grp->num_helpers = 0;
@@ -661,6 +705,7 @@ int rtw_coop_rx_add_helper(_adapter *adapter)
 	grp->helpers[grp->num_helpers] = adapter;
 	grp->helper_dvobjs[grp->num_helpers] = adapter_to_dvobj(adapter);
 	grp->num_helpers++;
+	WRITE_ONCE(adapter->is_coop_helper, 1);
 
 	if (grp->state == COOP_STATE_IDLE)
 		grp->state = COOP_STATE_BINDING;
@@ -691,6 +736,7 @@ int rtw_coop_rx_remove_helper(_adapter *adapter)
 	for (i = 0; i < grp->num_helpers; i++) {
 		if (grp->helpers[i] == adapter) {
 			found = 1;
+			WRITE_ONCE(adapter->is_coop_helper, 0);
 			/* Shift remaining helpers down */
 			for (; i < grp->num_helpers - 1; i++) {
 				grp->helpers[i] = grp->helpers[i + 1];
@@ -764,6 +810,13 @@ void rtw_coop_rx_remove_adapter(_adapter *adapter)
 		spin_lock_irqsave(&grp->lock, flags);
 		grp->primary = NULL;
 		grp->primary_dvobj = NULL;
+		{
+			int j;
+			for (j = 0; j < grp->num_helpers; j++) {
+				if (grp->helpers[j])
+					WRITE_ONCE(grp->helpers[j]->is_coop_helper, 0);
+			}
+		}
 		grp->num_helpers = 0;
 		memset(grp->helpers, 0, sizeof(grp->helpers));
 		memset(grp->helper_dvobjs, 0, sizeof(grp->helper_dvobjs));
@@ -1428,13 +1481,13 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 			}
 		}
 	} else {
-		unsigned long flags;
+		unsigned long nq_flags;
 		bool is_dup;
 
-		spin_lock_irqsave(&grp->lock, flags);
+		spin_lock_irqsave(&grp->nonqos_lock, nq_flags);
 		is_dup = coop_nonqos_check_and_record(grp, pattrib->seq_num,
 						      pattrib->ta);
-		spin_unlock_irqrestore(&grp->lock, flags);
+		spin_unlock_irqrestore(&grp->nonqos_lock, nq_flags);
 
 		if (is_dup) {
 			atomic_inc(&grp->stats.helper_rx_dup_dropped);
@@ -1562,20 +1615,23 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	 * the drain tasklet. This decouples the helper's softirq
 	 * from the primary's recv path, avoiding contention that
 	 * caused 60-86% packet loss on the primary at high rates.
+	 *
+	 * Backpressure policy: drop the NEWEST frame (the one we're
+	 * about to enqueue) rather than the oldest already queued.
+	 * The oldest frame may be the one the reorder window is
+	 * stalling on — dropping it causes a reorder timeout
+	 * (~50-100 ms latency spike). The newest frame is more likely
+	 * a duplicate that the primary already received.
 	 */
-	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
-	if (atomic_inc_return(&grp->pending_count) > COOP_PENDING_MAX) {
-		/* Over limit — dequeue and drop. atomic_inc_return makes
-		 * the check-and-increment atomic, preventing burst overrun. */
-		pframe_primary = rtw_alloc_recvframe(&grp->pending_queue);
-		atomic_dec(&grp->pending_count);
+	if (atomic_read(&grp->pending_count) >= coop_pending_max(grp)) {
 		atomic_inc(&grp->stats.helper_rx_backpressure);
-		if (pframe_primary)
-			rtw_free_recvframe(pframe_primary,
-					   &primary->recvpriv.free_recv_queue);
+		rtw_free_recvframe(pframe_primary,
+				   &primary->recvpriv.free_recv_queue);
 		rcu_read_unlock();
 		return RTW_RX_HANDLED;
 	}
+	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
+	atomic_inc(&grp->pending_count);
 	atomic_inc(&grp->stats.helper_rx_deferred);
 	tasklet_schedule(&grp->coop_rx_tasklet);
 
@@ -1831,6 +1887,18 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 		} /* end pre-capture scope */
 
 		processed++;
+
+		/* Periodically release RCU to avoid blocking grace
+		 * periods for too long (up to 64 * decrypt_time).
+		 * Re-validate primary/state after re-acquiring. */
+		if (processed % COOP_RCU_BATCH == 0) {
+			rcu_read_unlock();
+			rcu_read_lock();
+			primary = READ_ONCE(grp->primary);
+			if (!primary || rtw_is_drv_stopped(primary) ||
+			    READ_ONCE(grp->state) != COOP_STATE_ACTIVE)
+				break;
+		}
 	}
 
 	/* If queue still has frames, reschedule */

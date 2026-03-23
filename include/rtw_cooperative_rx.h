@@ -105,7 +105,9 @@ struct cooperative_rx_group {
 	u8 bound_channel;
 	u8 bound_bw;
 
-	/* Non-QoS dedup cache */
+	/* Non-QoS dedup cache — protected by its own lock to avoid
+	 * contention with grp->lock (membership changes) */
+	spinlock_t nonqos_lock;
 	struct coop_nonqos_seq_cache nonqos_cache;
 
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
@@ -117,6 +119,12 @@ struct cooperative_rx_group {
 	struct crypto_aead *tfm_gcm;	/* gcm(aes) for GCMP-128/256 */
 	u8 cached_key[32];		/* last key set on transforms */
 	u8 cached_key_len;		/* length of cached_key (16 or 32) */
+	/* Pre-allocated AEAD request — avoids GFP_ATOMIC alloc/free
+	 * per frame in the drain tasklet. Sized for the largest
+	 * transform's reqsize. Only accessed from drain tasklet
+	 * (serialized), so no locking needed. */
+	struct aead_request *prealloc_req;
+	size_t prealloc_reqsize;	/* allocated __ctx size */
 #endif
 
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
@@ -132,13 +140,17 @@ struct cooperative_rx_group {
 	_tasklet coop_rx_tasklet;	/* drains pending_queue */
 	atomic_t pending_count;		/* backpressure gauge */
 	/*
-	 * Tuning constants. PENDING_MAX must leave enough headroom in
-	 * the primary's 256-frame pool (NR_RECVFRAME) for its USB recv
-	 * pipeline. With drop_primary=1, all traffic goes through the
-	 * pending queue, so this is the binding constraint.
+	 * Tuning constants. PENDING_MAX scales with helper count to
+	 * absorb AMPDU bursts without backpressure drops. Must leave
+	 * headroom in the primary's 256-frame pool (NR_RECVFRAME)
+	 * for its USB recv pipeline. With 4 helpers:
+	 * 48 * (1+4) = 240, leaving 16 for primary — tight but OK
+	 * since helpers share the pool transiently.
 	 */
-#define COOP_PENDING_MAX	48	/* drop threshold (was 128) */
-#define COOP_BATCH_SIZE		64	/* frames per tasklet run (was 32) */
+#define COOP_PENDING_BASE	48	/* per-helper burst budget */
+#define coop_pending_max(grp)	(COOP_PENDING_BASE * (1 + (grp)->num_helpers))
+#define COOP_BATCH_SIZE		64	/* frames per tasklet run */
+#define COOP_RCU_BATCH		16	/* re-check RCU every N frames */
 
 	/* Statistics */
 	struct coop_rx_stats stats;
@@ -197,25 +209,7 @@ static inline bool rtw_coop_rx_active(void)
 
 static inline bool rtw_coop_rx_is_helper(_adapter *adapter)
 {
-	struct cooperative_rx_group *grp;
-	int i, n;
-
-	if (!rtw_coop_rx_enabled())
-		return false;
-	grp = READ_ONCE(rtw_coop_rx_group);
-	if (!grp || READ_ONCE(grp->state) < COOP_STATE_BINDING)
-		return false;
-	/* Clamp to array bounds: num_helpers can shrink concurrently
-	 * (helper removal shifts the array), so a stale read must
-	 * never index past COOP_MAX_HELPERS. */
-	n = READ_ONCE(grp->num_helpers);
-	if (n > COOP_MAX_HELPERS)
-		n = COOP_MAX_HELPERS;
-	for (i = 0; i < n; i++) {
-		if (READ_ONCE(grp->helpers[i]) == adapter)
-			return true;
-	}
-	return false;
+	return READ_ONCE(adapter->is_coop_helper);
 }
 
 /* sysfs / proc interface */
