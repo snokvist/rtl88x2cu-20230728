@@ -516,6 +516,7 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 	grp->cam_is_ap = is_ap;
 	grp->cam_ap_num_stas = 0;
 	memset(grp->cam_ap_sta_valid, 0, sizeof(grp->cam_ap_sta_valid));
+	memset(grp->cam_ap_sta_is256, 0, sizeof(grp->cam_ap_sta_is256));
 
 	for (i = 0; i < num_helpers; i++) {
 		_adapter *helper = helpers[i];
@@ -603,12 +604,19 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 		}
 		_exit_critical_bh(&pstapriv->sta_hash_lock, &irqL);
 
-		/* Phase 2: program CAM outside the lock (write_cam sleeps) */
+		/* Phase 2: program CAM outside the lock (write_cam sleeps).
+		 * Bookkeeping updates on the slot table are done under
+		 * grp->lock to prevent races with concurrent notify calls. */
 		for (j = 0; j < snap_count; j++) {
 			bool sta_256 = !!(snap_stas[j].algo & _SEC_TYPE_256_);
-			int idx = coop_cam_ap_alloc_slot(grp,
-							 snap_stas[j].mac);
+			unsigned long cam_flags;
+			int idx;
+			u8 cam_slot;
+
+			spin_lock_irqsave(&grp->lock, cam_flags);
+			idx = coop_cam_ap_alloc_slot(grp, snap_stas[j].mac);
 			if (idx < 0) {
+				spin_unlock_irqrestore(&grp->lock, cam_flags);
 				RTW_WARN("coop_rx: CAM mirror — no slot for "
 					 MAC_FMT"\n",
 					 MAC_ARG(snap_stas[j].mac));
@@ -620,12 +628,13 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 			grp->cam_ap_sta_valid[idx] = 1;
 			grp->cam_ap_sta_is256[idx] = sta_256;
 			grp->cam_ap_num_stas++;
+			cam_slot = coop_cam_ap_ptk_slot(idx, sta_256);
+			spin_unlock_irqrestore(&grp->lock, cam_flags);
 
 			for (i = 0; i < num_helpers; i++) {
 				if (!helpers[i])
 					continue;
-				coop_cam_program_ptk(helpers[i],
-					coop_cam_ap_ptk_slot(idx, sta_256),
+				coop_cam_program_ptk(helpers[i], cam_slot,
 					snap_stas[j].algo,
 					snap_stas[j].mac,
 					snap_stas[j].key);
@@ -644,48 +653,76 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 {
 	int i, j;
+	unsigned long flags;
+	bool is_ap;
+	int snap_helpers;
+	_adapter *helper_snap[COOP_MAX_HELPERS];
+	struct {
+		bool valid;
+		bool is256;
+		u8 slot;
+	} ap_snap[COOP_CAM_AP_MAX_STAS];
 
 	if (!grp->cam_mirror_active)
 		return;
 
-	for (i = 0; i < grp->num_helpers; i++) {
-		_adapter *helper = grp->helpers[i];
+	/* Snapshot all shared state under lock, then release before
+	 * calling clear_cam_entry() which acquires a sleeping mutex. */
+	spin_lock_irqsave(&grp->lock, flags);
 
-		if (!helper)
+	is_ap = grp->cam_is_ap;
+	snap_helpers = grp->num_helpers;
+	for (i = 0; i < snap_helpers; i++)
+		helper_snap[i] = grp->helpers[i];
+
+	if (is_ap) {
+		for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
+			ap_snap[j].valid = grp->cam_ap_sta_valid[j];
+			ap_snap[j].is256 = grp->cam_ap_sta_is256[j];
+			ap_snap[j].slot = coop_cam_ap_ptk_slot(j,
+						ap_snap[j].is256);
+		}
+		/* Invalidate table under lock to prevent concurrent
+		 * notify_sta_del from double-clearing same slots. */
+		memset(grp->cam_ap_sta_valid, 0,
+		       sizeof(grp->cam_ap_sta_valid));
+		grp->cam_ap_num_stas = 0;
+	}
+
+	grp->cam_mirror_active = 0;
+
+	spin_unlock_irqrestore(&grp->lock, flags);
+
+	/* HW cleanup outside the lock (clear_cam_entry can sleep) */
+	for (i = 0; i < snap_helpers; i++) {
+		if (!helper_snap[i])
 			continue;
 
-		if (!grp->cam_is_ap) {
+		if (!is_ap) {
 			/* STA mode: clear slot 0 (+1 for 256-bit) */
-			clear_cam_entry(helper, 0);
-			clear_cam_entry(helper, 1);
+			clear_cam_entry(helper_snap[i], 0);
+			clear_cam_entry(helper_snap[i], 1);
 		} else {
-			/* AP mode: clear all per-STA PTK slots using
-			 * the per-STA is_256 that was recorded at install */
+			/* AP mode: clear per-STA PTK slots */
 			for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
-				bool s256;
-				u8 slot;
-
-				if (!grp->cam_ap_sta_valid[j])
+				if (!ap_snap[j].valid)
 					continue;
-				s256 = grp->cam_ap_sta_is256[j];
-				slot = coop_cam_ap_ptk_slot(j, s256);
-				clear_cam_entry(helper, slot);
-				if (s256)
-					clear_cam_entry(helper, slot + 1);
+				clear_cam_entry(helper_snap[i],
+						ap_snap[j].slot);
+				if (ap_snap[j].is256)
+					clear_cam_entry(helper_snap[i],
+							ap_snap[j].slot + 1);
 			}
 		}
 
 		/* Clear GTK slot 4 (+5 for 256-bit) */
-		clear_cam_entry(helper, 4);
-		clear_cam_entry(helper, 5);
+		clear_cam_entry(helper_snap[i], 4);
+		clear_cam_entry(helper_snap[i], 5);
 
 		/* Restore original SECCFG */
-		rtw_write16(helper, REG_SECCFG, grp->helper_seccfg_orig[i]);
+		rtw_write16(helper_snap[i], REG_SECCFG,
+			    grp->helper_seccfg_orig[i]);
 	}
-
-	memset(grp->cam_ap_sta_valid, 0, sizeof(grp->cam_ap_sta_valid));
-	grp->cam_ap_num_stas = 0;
-	grp->cam_mirror_active = 0;
 }
 
 /*
@@ -695,7 +732,9 @@ static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
 {
 	struct cooperative_rx_group *grp;
-	int i;
+	unsigned long flags;
+	int i, snap_helpers;
+	_adapter *helper_snap[COOP_MAX_HELPERS];
 
 	grp = READ_ONCE(rtw_coop_rx_group);
 	if (!grp || !grp->cam_mirror_active)
@@ -703,10 +742,16 @@ void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
 	if (grp->primary != adapter)
 		return;
 
-	for (i = 0; i < grp->num_helpers; i++) {
-		if (!grp->helpers[i])
+	spin_lock_irqsave(&grp->lock, flags);
+	snap_helpers = grp->num_helpers;
+	for (i = 0; i < snap_helpers; i++)
+		helper_snap[i] = grp->helpers[i];
+	spin_unlock_irqrestore(&grp->lock, flags);
+
+	for (i = 0; i < snap_helpers; i++) {
+		if (!helper_snap[i])
 			continue;
-		coop_cam_program_gtk(grp, grp->helpers[i]);
+		coop_cam_program_gtk(grp, helper_snap[i]);
 	}
 
 	RTW_INFO("coop_rx: CAM mirror GTK rekeyed (keyid=%d)\n",
@@ -728,7 +773,8 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 {
 	struct cooperative_rx_group *grp;
 	unsigned long flags;
-	int i;
+	int i, snap_helpers;
+	_adapter *helper_snap[COOP_MAX_HELPERS];
 	u8 algo;
 	bool is_ap;
 
@@ -746,11 +792,18 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 	is_ap = check_fwstate(&adapter->mlmepriv, WIFI_AP_STATE);
 
 	if (!is_ap) {
-		/* STA mode: update slot 0 for PTK rekey (no slot table) */
-		for (i = 0; i < grp->num_helpers; i++) {
-			if (!grp->helpers[i])
+		/* STA mode: update slot 0 for PTK rekey (no slot table).
+		 * Snapshot helpers under lock before MMIO. */
+		spin_lock_irqsave(&grp->lock, flags);
+		snap_helpers = grp->num_helpers;
+		for (i = 0; i < snap_helpers; i++)
+			helper_snap[i] = grp->helpers[i];
+		spin_unlock_irqrestore(&grp->lock, flags);
+
+		for (i = 0; i < snap_helpers; i++) {
+			if (!helper_snap[i])
 				continue;
-			coop_cam_program_ptk(grp->helpers[i], 0, algo,
+			coop_cam_program_ptk(helper_snap[i], 0, algo,
 					     psta->cmn.mac_addr,
 					     psta->dot118021x_UncstKey.skey);
 		}
@@ -758,8 +811,8 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 			 MAC_ARG(psta->cmn.mac_addr));
 	} else {
 		/* AP mode: allocate/reuse slot for this STA.
-		 * Hold grp->lock for slot table update, release before
-		 * HW programming (write_cam can sleep). */
+		 * Hold grp->lock for slot table + helper snapshot,
+		 * release before HW programming (write_cam can sleep). */
 		bool is_256 = !!(algo & _SEC_TYPE_256_);
 		bool need_clear_old = false;
 		bool old_256 = false;
@@ -799,24 +852,29 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 		grp->cam_ap_sta_is256[idx] = is_256;
 		cam_slot = coop_cam_ap_ptk_slot(idx, is_256);
 
+		/* Snapshot helpers while still under lock */
+		snap_helpers = grp->num_helpers;
+		for (i = 0; i < snap_helpers; i++)
+			helper_snap[i] = grp->helpers[i];
+
 		spin_unlock_irqrestore(&grp->lock, flags);
 
 		/* HW programming outside the lock (can sleep) */
 		if (need_clear_old) {
-			for (i = 0; i < grp->num_helpers; i++) {
-				if (!grp->helpers[i])
+			for (i = 0; i < snap_helpers; i++) {
+				if (!helper_snap[i])
 					continue;
-				clear_cam_entry(grp->helpers[i], old_slot);
+				clear_cam_entry(helper_snap[i], old_slot);
 				if (old_256)
-					clear_cam_entry(grp->helpers[i],
+					clear_cam_entry(helper_snap[i],
 							old_slot + 1);
 			}
 		}
 
-		for (i = 0; i < grp->num_helpers; i++) {
-			if (!grp->helpers[i])
+		for (i = 0; i < snap_helpers; i++) {
+			if (!helper_snap[i])
 				continue;
-			coop_cam_program_ptk(grp->helpers[i], cam_slot,
+			coop_cam_program_ptk(helper_snap[i], cam_slot,
 					     algo, psta->cmn.mac_addr,
 					     psta->dot118021x_UncstKey.skey);
 		}
@@ -840,6 +898,8 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 	struct cooperative_rx_group *grp;
 	unsigned long flags;
 	int i, found_idx = -1;
+	int snap_helpers = 0;
+	_adapter *helper_snap[COOP_MAX_HELPERS];
 	bool s256 = false;
 	u8 slot = 0;
 
@@ -853,7 +913,7 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 	if (!check_fwstate(&adapter->mlmepriv, WIFI_AP_STATE))
 		return;
 
-	/* Phase 1: find and invalidate slot under lock */
+	/* Phase 1: find and invalidate slot + snapshot helpers under lock */
 	spin_lock_irqsave(&grp->lock, flags);
 
 	for (i = 0; i < COOP_CAM_AP_MAX_STAS; i++) {
@@ -871,8 +931,15 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 		grp->cam_ap_sta_valid[i] = 0;
 		memset(grp->cam_ap_sta_mac[i], 0, ETH_ALEN);
 		grp->cam_ap_sta_is256[i] = 0;
-		grp->cam_ap_num_stas--;
+		if (grp->cam_ap_num_stas > 0)
+			grp->cam_ap_num_stas--;
 		break;
+	}
+
+	if (found_idx >= 0) {
+		snap_helpers = grp->num_helpers;
+		for (i = 0; i < snap_helpers; i++)
+			helper_snap[i] = grp->helpers[i];
 	}
 
 	spin_unlock_irqrestore(&grp->lock, flags);
@@ -881,12 +948,12 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 		return;
 
 	/* Phase 2: clear HW CAM outside the lock (can sleep) */
-	for (i = 0; i < grp->num_helpers; i++) {
-		if (!grp->helpers[i])
+	for (i = 0; i < snap_helpers; i++) {
+		if (!helper_snap[i])
 			continue;
-		clear_cam_entry(grp->helpers[i], slot);
+		clear_cam_entry(helper_snap[i], slot);
 		if (s256)
-			clear_cam_entry(grp->helpers[i], slot + 1);
+			clear_cam_entry(helper_snap[i], slot + 1);
 	}
 
 	RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT

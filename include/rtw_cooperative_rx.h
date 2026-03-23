@@ -199,9 +199,11 @@ int rtw_coop_rx_bind_session(_adapter *primary);
 void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
 void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter);
 void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta);
 void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta);
+#endif
 
 /* Drain tasklet for deferred helper frame processing */
 #include <linux/version.h>
