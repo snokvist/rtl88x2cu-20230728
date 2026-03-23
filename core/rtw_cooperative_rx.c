@@ -719,12 +719,18 @@ void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
  * or rekeyed. Programs the STA's PTK into helpers' CAM.
  *
  * In STA mode, also updates slot 0 for PTK rekey.
+ *
+ * Locking: grp->lock protects the slot table bookkeeping. The lock is
+ * released before calling write_cam()/clear_cam_entry() which acquire
+ * a mutex internally (sec_cam_access_mutex) and can sleep.
  */
 void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 {
 	struct cooperative_rx_group *grp;
+	unsigned long flags;
 	int i;
 	u8 algo;
+	bool is_ap;
 
 	grp = READ_ONCE(rtw_coop_rx_group);
 	if (!grp || !grp->cam_mirror_active)
@@ -736,8 +742,11 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 	if (algo == _NO_PRIVACY_)
 		return;
 
-	if (!grp->cam_is_ap) {
-		/* STA mode: update slot 0 for PTK rekey */
+	/* Live mode check — avoids stale cam_is_ap if mode changed */
+	is_ap = check_fwstate(&adapter->mlmepriv, WIFI_AP_STATE);
+
+	if (!is_ap) {
+		/* STA mode: update slot 0 for PTK rekey (no slot table) */
 		for (i = 0; i < grp->num_helpers; i++) {
 			if (!grp->helpers[i])
 				continue;
@@ -748,11 +757,21 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 		RTW_INFO("coop_rx: CAM mirror PTK rekeyed for "MAC_FMT"\n",
 			 MAC_ARG(psta->cmn.mac_addr));
 	} else {
-		/* AP mode: allocate/reuse slot for this STA */
+		/* AP mode: allocate/reuse slot for this STA.
+		 * Hold grp->lock for slot table update, release before
+		 * HW programming (write_cam can sleep). */
 		bool is_256 = !!(algo & _SEC_TYPE_256_);
-		int idx = coop_cam_ap_alloc_slot(grp, psta->cmn.mac_addr);
+		bool need_clear_old = false;
+		bool old_256 = false;
+		u8 old_slot = 0;
+		int idx;
+		u8 cam_slot;
 
+		spin_lock_irqsave(&grp->lock, flags);
+
+		idx = coop_cam_ap_alloc_slot(grp, psta->cmn.mac_addr);
 		if (idx < 0) {
+			spin_unlock_irqrestore(&grp->lock, flags);
 			RTW_WARN("coop_rx: CAM mirror — no slot for "MAC_FMT
 				 " (%d/%d), SW decrypt fallback\n",
 				 MAC_ARG(psta->cmn.mac_addr),
@@ -763,23 +782,11 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 
 		if (grp->cam_ap_sta_valid[idx]) {
 			/* Existing slot — rekey. If key width changed
-			 * (128↔256), clear old entry at old stride first
-			 * to avoid stale CAM slots. */
-			bool old_256 = grp->cam_ap_sta_is256[idx];
-
+			 * (128↔256), must clear old entry at old stride. */
+			old_256 = grp->cam_ap_sta_is256[idx];
 			if (old_256 != is_256) {
-				u8 old_slot = coop_cam_ap_ptk_slot(idx,
-								   old_256);
-				for (i = 0; i < grp->num_helpers; i++) {
-					if (!grp->helpers[i])
-						continue;
-					clear_cam_entry(grp->helpers[i],
-							old_slot);
-					if (old_256)
-						clear_cam_entry(
-							grp->helpers[i],
-							old_slot + 1);
-				}
+				need_clear_old = true;
+				old_slot = coop_cam_ap_ptk_slot(idx, old_256);
 			}
 		} else {
 			/* New slot */
@@ -790,12 +797,26 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 		}
 
 		grp->cam_ap_sta_is256[idx] = is_256;
+		cam_slot = coop_cam_ap_ptk_slot(idx, is_256);
+
+		spin_unlock_irqrestore(&grp->lock, flags);
+
+		/* HW programming outside the lock (can sleep) */
+		if (need_clear_old) {
+			for (i = 0; i < grp->num_helpers; i++) {
+				if (!grp->helpers[i])
+					continue;
+				clear_cam_entry(grp->helpers[i], old_slot);
+				if (old_256)
+					clear_cam_entry(grp->helpers[i],
+							old_slot + 1);
+			}
+		}
 
 		for (i = 0; i < grp->num_helpers; i++) {
 			if (!grp->helpers[i])
 				continue;
-			coop_cam_program_ptk(grp->helpers[i],
-					     coop_cam_ap_ptk_slot(idx, is_256),
+			coop_cam_program_ptk(grp->helpers[i], cam_slot,
 					     algo, psta->cmn.mac_addr,
 					     psta->dot118021x_UncstKey.skey);
 		}
@@ -810,51 +831,68 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 /*
  * STA removal notification — called when an AP client disassociates.
  * Clears that STA's PTK from all helpers' CAM and frees the slot.
+ *
+ * Locking: grp->lock protects the slot table lookup and invalidation.
+ * Released before clear_cam_entry() which can sleep.
  */
 void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 {
 	struct cooperative_rx_group *grp;
-	int i, j;
+	unsigned long flags;
+	int i, found_idx = -1;
+	bool s256 = false;
+	u8 slot = 0;
 
 	grp = READ_ONCE(rtw_coop_rx_group);
-	if (!grp || !grp->cam_mirror_active || !grp->cam_is_ap)
+	if (!grp || !grp->cam_mirror_active)
 		return;
 	if (grp->primary != adapter)
 		return;
 
-	for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
-		bool s256;
-		u8 slot;
+	/* Live mode check instead of cached cam_is_ap */
+	if (!check_fwstate(&adapter->mlmepriv, WIFI_AP_STATE))
+		return;
 
-		if (!grp->cam_ap_sta_valid[j])
+	/* Phase 1: find and invalidate slot under lock */
+	spin_lock_irqsave(&grp->lock, flags);
+
+	for (i = 0; i < COOP_CAM_AP_MAX_STAS; i++) {
+		if (!grp->cam_ap_sta_valid[i])
 			continue;
-		if (!_rtw_memcmp(grp->cam_ap_sta_mac[j],
+		if (!_rtw_memcmp(grp->cam_ap_sta_mac[i],
 				 psta->cmn.mac_addr, ETH_ALEN))
 			continue;
 
-		/* Found — use per-STA is_256 recorded at install time */
-		s256 = grp->cam_ap_sta_is256[j];
-		slot = coop_cam_ap_ptk_slot(j, s256);
+		/* Found — snapshot and invalidate */
+		found_idx = i;
+		s256 = grp->cam_ap_sta_is256[i];
+		slot = coop_cam_ap_ptk_slot(i, s256);
 
-		for (i = 0; i < grp->num_helpers; i++) {
-			if (!grp->helpers[i])
-				continue;
-			clear_cam_entry(grp->helpers[i], slot);
-			if (s256)
-				clear_cam_entry(grp->helpers[i], slot + 1);
-		}
-
-		grp->cam_ap_sta_valid[j] = 0;
-		memset(grp->cam_ap_sta_mac[j], 0, ETH_ALEN);
-		grp->cam_ap_sta_is256[j] = 0;
+		grp->cam_ap_sta_valid[i] = 0;
+		memset(grp->cam_ap_sta_mac[i], 0, ETH_ALEN);
+		grp->cam_ap_sta_is256[i] = 0;
 		grp->cam_ap_num_stas--;
-
-		RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
-			 " removed from slot %d (%d/%d)\n",
-			 MAC_ARG(psta->cmn.mac_addr), j,
-			 grp->cam_ap_num_stas, COOP_CAM_AP_MAX_STAS);
-		return;
+		break;
 	}
+
+	spin_unlock_irqrestore(&grp->lock, flags);
+
+	if (found_idx < 0)
+		return;
+
+	/* Phase 2: clear HW CAM outside the lock (can sleep) */
+	for (i = 0; i < grp->num_helpers; i++) {
+		if (!grp->helpers[i])
+			continue;
+		clear_cam_entry(grp->helpers[i], slot);
+		if (s256)
+			clear_cam_entry(grp->helpers[i], slot + 1);
+	}
+
+	RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
+		 " removed from slot %d (%d/%d)\n",
+		 MAC_ARG(psta->cmn.mac_addr), found_idx,
+		 grp->cam_ap_num_stas, COOP_CAM_AP_MAX_STAS);
 }
 #endif /* CONFIG_COOP_RX_CAM_MIRROR */
 
