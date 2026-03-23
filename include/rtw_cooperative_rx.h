@@ -34,6 +34,7 @@ struct dvobj_priv;
 struct net_device;
 union recv_frame;
 struct dentry;
+struct sta_info;
 
 #define COOP_MAX_HELPERS		4
 #define COOP_NONQOS_SEQ_CACHE_SZ	32
@@ -140,9 +141,19 @@ struct cooperative_rx_group {
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
 	/* CAM mirroring: program helper's HW crypto engine with
 	 * primary's keys for zero-cost HW decrypt on helper frames.
-	 * Set during bind_session, cleared during unbind/deinit. */
+	 * Set during bind_session, cleared during unbind/deinit.
+	 *
+	 * AP mode: per-STA PTK slots are managed dynamically as
+	 * clients associate/disassociate (max COOP_CAM_AP_MAX_STAS). */
 	u8 cam_mirror_active;
+	u8 cam_is_ap;			/* operating in AP mode */
 	u16 helper_seccfg_orig[COOP_MAX_HELPERS]; /* saved SECCFG */
+
+	/* AP mode per-STA CAM tracking */
+#define COOP_CAM_AP_MAX_STAS	8
+	u8 cam_ap_sta_valid[COOP_CAM_AP_MAX_STAS];
+	u8 cam_ap_sta_mac[COOP_CAM_AP_MAX_STAS][ETH_ALEN];
+	u8 cam_ap_num_stas;
 #endif
 
 	/* Deferred processing: helper enqueues, drain tasklet processes */
@@ -188,6 +199,8 @@ void rtw_coop_rx_unbind_session(void);
 int rtw_coop_rx_enable_helper_monitor(_adapter *helper, u8 channel);
 void rtw_coop_rx_notify_channel_switch(_adapter *adapter);
 void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter);
+void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta);
+void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta);
 
 /* Drain tasklet for deferred helper frame processing */
 #include <linux/version.h>

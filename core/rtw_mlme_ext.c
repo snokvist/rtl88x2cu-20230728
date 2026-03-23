@@ -15044,8 +15044,13 @@ write_to_cam:
 		write_cam(padapter, cam_id, ctrl, pparm->addr, pparm->key,
 			pparm->algorithm & _SEC_TYPE_256_);
 
-		if (!(pparm->gk))
+		if (!(pparm->gk)) {
 			ATOMIC_INC(&psta->keytrack);	/*CVE-2020-24587*/
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
+			/* Mirror this STA's PTK to helper HW CAM */
+			rtw_coop_rx_notify_sta_key(padapter, psta);
+#endif
+		}
 	}
 	ret = H2C_SUCCESS_RSP;
 

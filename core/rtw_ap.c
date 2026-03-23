@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #ifdef CONFIG_AP_MODE
 
@@ -4192,6 +4193,11 @@ u8 ap_free_sta(_adapter *padapter, struct sta_info *psta, bool active, u8 subtyp
 	beacon_updated = bss_cap_update_on_sta_leave(padapter, psta);
 
 	report_del_sta_event(padapter, psta->cmn.mac_addr, reason, enqueue, _FALSE);
+
+#ifdef CONFIG_COOP_RX_CAM_MIRROR
+	/* Remove this STA's PTK from helper HW CAM before clearing keys */
+	rtw_coop_rx_notify_sta_del(padapter, psta);
+#endif
 
 	/* clear cam entry / key */
 	rtw_clearstakey_cmd(padapter, psta, enqueue);

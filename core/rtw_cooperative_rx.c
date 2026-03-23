@@ -383,37 +383,126 @@ static int coop_rx_kernel_decrypt(struct cooperative_rx_group *grp,
  * ============================================================
  *
  * Programs the helper adapter's HW CAM (Content Addressable Memory)
- * with the primary adapter's PTK/GTK keys. If the chip performs CAM
- * lookup even in AAP mode (promiscuous address filtering), the HW
- * crypto engine will decrypt helper frames automatically, eliminating
- * all software decryption overhead.
+ * with the primary adapter's keys. The chip performs CAM lookup even
+ * in AAP mode (promiscuous address filtering), so the HW crypto
+ * engine decrypts helper frames automatically at zero CPU cost.
  *
- * Verified working on RTL8822CU: the chip performs CAM lookup
- * even with BIT_AAP set (promiscuous address filtering).
+ * Verified working on RTL8822CU: CAM lookup works with BIT_AAP set.
  * HW strips MIC after verification but keeps IV header.
+ *
+ * CAM slot layout on each helper:
+ *
+ *   STA mode (single peer):
+ *     Slot 0 (+1 for 256-bit): PTK, MAC = AP BSSID
+ *     Slot 4 (+5 for 256-bit): GTK, MAC = AP BSSID
+ *
+ *   AP mode (multiple client STAs):
+ *     Slot 4 (+5 for 256-bit): GTK, MAC = own BSSID
+ *     Slots 6..6+N-1 (or pairs for 256-bit): per-STA PTKs
+ *     Max COOP_CAM_AP_MAX_STAS clients in HW; overflow → SW decrypt
  */
 
+/* AP mode CAM: first PTK slot (COOP_CAM_AP_MAX_STAS is in header) */
+#define COOP_CAM_AP_PTK_BASE	6
+
+/* Return CAM slot for AP STA at index idx.
+ * 256-bit keys use consecutive even slots (stride 2). */
+static inline u8 coop_cam_ap_ptk_slot(int idx, bool is_256)
+{
+	return COOP_CAM_AP_PTK_BASE + idx * (is_256 ? 2 : 1);
+}
+
+/*
+ * Enable RX decrypt on a helper (called once during install).
+ */
+static void coop_cam_enable_hw_decrypt(struct cooperative_rx_group *grp,
+				       _adapter *helper, int helper_idx)
+{
+	u16 scr = rtw_read16(helper, REG_SECCFG);
+
+	grp->helper_seccfg_orig[helper_idx] = scr;
+	scr |= SCR_RxDecEnable | SCR_CHK_KEYID | SCR_RXBCUSEDK;
+	rtw_write16(helper, REG_SECCFG, scr);
+}
+
+/*
+ * Program GTK on one helper (used by install and rekey).
+ */
+static void coop_cam_program_gtk(struct cooperative_rx_group *grp,
+				 _adapter *helper)
+{
+	struct security_priv *psec = &grp->primary->securitypriv;
+	u8 algo = psec->dot11PrivacyAlgrthm;
+	u8 gtk_keyid = psec->dot118021XGrpKeyid;
+	u8 *gtk_key = psec->dot118021XGrpKey[gtk_keyid].skey;
+	bool is_256 = !!(algo & _SEC_TYPE_256_);
+	u16 ctrl;
+
+	ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
+	if (is_256)
+		ctrl |= BIT(9);
+
+	/* Slot 4: GTK. RTL8822C CAM matches by A2 (TA), which is the
+	 * BSSID for broadcast/multicast frames in both STA and AP mode. */
+	write_cam(helper, 4, ctrl, grp->bound_bssid, gtk_key, is_256);
+}
+
+/*
+ * Program one STA's PTK on one helper at a specific CAM slot.
+ */
+static void coop_cam_program_ptk(_adapter *helper, u8 cam_slot,
+				 u8 algo, u8 *mac, u8 *key)
+{
+	bool is_256 = !!(algo & _SEC_TYPE_256_);
+	u16 ctrl;
+
+	ctrl = BIT(15) | ((algo & 0x07) << 2);  /* keyid = 0 */
+	if (is_256)
+		ctrl |= BIT(9);
+
+	write_cam(helper, cam_slot, ctrl, mac, key, is_256);
+}
+
+/*
+ * Allocate an AP STA CAM slot. Returns index (0..MAX-1) or -1 if full.
+ */
+static int coop_cam_ap_alloc_slot(struct cooperative_rx_group *grp,
+				  const u8 *sta_mac)
+{
+	int i;
+
+	/* Check for existing entry (rekey of same STA) */
+	for (i = 0; i < COOP_CAM_AP_MAX_STAS; i++) {
+		if (grp->cam_ap_sta_valid[i] &&
+		    _rtw_memcmp(grp->cam_ap_sta_mac[i], sta_mac, ETH_ALEN))
+			return i;
+	}
+
+	/* Find free slot */
+	for (i = 0; i < COOP_CAM_AP_MAX_STAS; i++) {
+		if (!grp->cam_ap_sta_valid[i])
+			return i;
+	}
+
+	return -1; /* full */
+}
+
+/*
+ * coop_rx_cam_mirror_install — initial CAM setup during bind_session.
+ *
+ * STA mode: programs the single peer's PTK + GTK.
+ * AP mode: programs GTK only; per-STA PTKs are added dynamically
+ * via rtw_coop_rx_notify_sta_key() as clients complete 4-way handshake.
+ * Any already-associated STAs with keys installed are picked up here.
+ */
 static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 				       _adapter *primary,
 				       _adapter **helpers, int num_helpers)
 {
 	struct security_priv *psec = &primary->securitypriv;
-	struct sta_info *psta;
-	u8 *ptk_key, *gtk_key;
 	u8 algo;
-	u8 gtk_keyid;
-	u16 ptk_ctrl, gtk_ctrl;
-	bool is_256;
 	int i;
-	u16 scr;
-
-	/* Look up primary's STA context for PTK */
-	psta = rtw_get_stainfo(&primary->stapriv, grp->bound_bssid);
-	if (!psta) {
-		RTW_WARN("coop_rx: CAM mirror — no sta_info for BSSID, "
-			 "keys may not be installed yet\n");
-		return;
-	}
+	bool is_ap;
 
 	algo = psec->dot11PrivacyAlgrthm;
 	if (algo == _NO_PRIVACY_) {
@@ -421,20 +510,12 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 		return;
 	}
 
-	ptk_key = psta->dot118021x_UncstKey.skey;
-	gtk_keyid = psec->dot118021XGrpKeyid;
-	gtk_key = psec->dot118021XGrpKey[gtk_keyid].skey;
+	is_ap = check_fwstate(&primary->mlmepriv, WIFI_AP_STATE);
 
-	/* Build CAM control words matching set_stakey_hdl() format:
-	 * BIT(15) = Valid, bits[4:2] = algorithm, bits[1:0] = keyid */
-	ptk_ctrl = BIT(15) | ((algo & 0x07) << 2);  /* keyid = 0 */
-	gtk_ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
-
-	is_256 = !!(algo & _SEC_TYPE_256_);
-	if (is_256) {
-		ptk_ctrl |= BIT(9);
-		gtk_ctrl |= BIT(9);
-	}
+	/* Initialize AP STA tracking */
+	grp->cam_is_ap = is_ap;
+	grp->cam_ap_num_stas = 0;
+	memset(grp->cam_ap_sta_valid, 0, sizeof(grp->cam_ap_sta_valid));
 
 	for (i = 0; i < num_helpers; i++) {
 		_adapter *helper = helpers[i];
@@ -443,40 +524,116 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 			continue;
 
 		RTW_INFO("coop_rx: CAM mirror — programming helper[%d] "
-			 "iface_id=%d algo=%d is_256=%d\n",
-			 i, helper->iface_id, algo, is_256);
+			 "iface_id=%d algo=%d is_ap=%d\n",
+			 i, helper->iface_id, algo, is_ap);
 
-		/* Program PTK entry (CAM slot 0): MAC = AP BSSID.
-		 * Use write_cam() not rtw_sec_write_cam_ent() to
-		 * handle 256-bit key split across two CAM entries. */
-		write_cam(helper, 0, ptk_ctrl,
-			  grp->bound_bssid, ptk_key, is_256);
+		if (!is_ap) {
+			/* STA mode: single peer PTK at slot 0 */
+			struct sta_info *psta;
 
-		/* Program GTK entry (CAM slot 4): MAC = AP BSSID.
-		 * RTL8822C CAM matches by A2 (TA), which is the AP's
-		 * BSSID even for broadcast/multicast frames. The driver's
-		 * own set_key_hdl uses get_bssid() for group RX CAM. */
-		write_cam(helper, 4, gtk_ctrl,
-			  grp->bound_bssid, gtk_key, is_256);
+			psta = rtw_get_stainfo(&primary->stapriv,
+					       grp->bound_bssid);
+			if (!psta) {
+				RTW_WARN("coop_rx: CAM mirror — no sta_info "
+					 "for BSSID, keys not installed yet\n");
+				continue;
+			}
 
-		/* Enable RX decrypt engine on helper HW */
-		scr = rtw_read16(helper, REG_SECCFG);
-		grp->helper_seccfg_orig[i] = scr;
-		scr |= SCR_RxDecEnable | SCR_CHK_KEYID | SCR_RXBCUSEDK;
-		rtw_write16(helper, REG_SECCFG, scr);
+			coop_cam_program_ptk(helper, 0, algo,
+					     grp->bound_bssid,
+					     psta->dot118021x_UncstKey.skey);
+		}
+
+		/* GTK at slot 4 (both STA and AP mode) */
+		coop_cam_program_gtk(grp, helper);
+
+		/* Enable HW decrypt engine */
+		coop_cam_enable_hw_decrypt(grp, helper, i);
 	}
 
 	grp->cam_mirror_active = 1;
-	RTW_INFO("coop_rx: CAM mirror installed (algo=%d, gtk_keyid=%d)\n",
-		 algo, gtk_keyid);
+
+	/* AP mode: pick up PTKs for any already-associated STAs */
+	if (is_ap) {
+		_irqL irqL;
+		struct sta_priv *pstapriv = &primary->stapriv;
+		struct sta_info *psta;
+		_list *phead, *plist;
+		struct sta_info *ap_self = rtw_get_stainfo(pstapriv,
+					adapter_mac_addr(primary));
+		struct sta_info *bmc_sta = rtw_get_bcmc_stainfo(primary);
+		int j;
+
+		_enter_critical_bh(&pstapriv->sta_hash_lock, &irqL);
+		for (j = 0; j < NUM_STA; j++) {
+			phead = &pstapriv->sta_hash[j];
+			plist = get_next(phead);
+			while (!rtw_end_of_queue_search(phead, plist)) {
+				psta = LIST_CONTAINOR(plist, struct sta_info,
+						      hash_list);
+				plist = get_next(plist);
+
+				/* Skip AP-self and broadcast pseudo-STAs */
+				if (!psta || psta == ap_self || psta == bmc_sta)
+					continue;
+
+				/* Only add if key is installed */
+				if (psta->dot118021XPrivacy == _NO_PRIVACY_)
+					continue;
+
+				/* Allocate CAM slot */
+				{
+					int idx = coop_cam_ap_alloc_slot(grp,
+							psta->cmn.mac_addr);
+					if (idx < 0) {
+						RTW_WARN("coop_rx: CAM mirror — "
+							 "no slot for "MAC_FMT
+							 "\n", MAC_ARG(
+							 psta->cmn.mac_addr));
+						continue;
+					}
+
+					memcpy(grp->cam_ap_sta_mac[idx],
+					       psta->cmn.mac_addr, ETH_ALEN);
+					grp->cam_ap_sta_valid[idx] = 1;
+					grp->cam_ap_num_stas++;
+
+					for (i = 0; i < num_helpers; i++) {
+						if (!helpers[i])
+							continue;
+						coop_cam_program_ptk(helpers[i],
+							coop_cam_ap_ptk_slot(idx,
+								!!(algo & _SEC_TYPE_256_)),
+							psta->dot118021XPrivacy,
+							psta->cmn.mac_addr,
+							psta->dot118021x_UncstKey.skey);
+					}
+
+					RTW_INFO("coop_rx: CAM mirror AP — "
+						 "existing STA "MAC_FMT
+						 " → slot %d\n",
+						 MAC_ARG(psta->cmn.mac_addr),
+						 idx);
+				}
+			}
+		}
+		_exit_critical_bh(&pstapriv->sta_hash_lock, &irqL);
+	}
+
+	RTW_INFO("coop_rx: CAM mirror installed (algo=%d, is_ap=%d, "
+		 "ap_stas=%d)\n", algo, is_ap, grp->cam_ap_num_stas);
 }
 
 static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 {
-	int i;
+	int i, j;
+	bool is_256;
 
 	if (!grp->cam_mirror_active)
 		return;
+
+	is_256 = !!(grp->primary->securitypriv.dot11PrivacyAlgrthm &
+		     _SEC_TYPE_256_);
 
 	for (i = 0; i < grp->num_helpers; i++) {
 		_adapter *helper = grp->helpers[i];
@@ -484,33 +641,43 @@ static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 		if (!helper)
 			continue;
 
-		/* Clear CAM entries (both 128-bit and 256-bit slots) */
-		clear_cam_entry(helper, 0);
-		clear_cam_entry(helper, 1);  /* 256-bit PTK second half */
+		if (!grp->cam_is_ap) {
+			/* STA mode: clear slot 0 (+1 for 256-bit) */
+			clear_cam_entry(helper, 0);
+			clear_cam_entry(helper, 1);
+		} else {
+			/* AP mode: clear all per-STA PTK slots */
+			for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
+				if (!grp->cam_ap_sta_valid[j])
+					continue;
+				clear_cam_entry(helper,
+					coop_cam_ap_ptk_slot(j, is_256));
+				if (is_256)
+					clear_cam_entry(helper,
+						coop_cam_ap_ptk_slot(j, is_256) + 1);
+			}
+		}
+
+		/* Clear GTK slot 4 (+5 for 256-bit) */
 		clear_cam_entry(helper, 4);
-		clear_cam_entry(helper, 5);  /* 256-bit GTK second half */
+		clear_cam_entry(helper, 5);
 
 		/* Restore original SECCFG */
 		rtw_write16(helper, REG_SECCFG, grp->helper_seccfg_orig[i]);
 	}
 
+	memset(grp->cam_ap_sta_valid, 0, sizeof(grp->cam_ap_sta_valid));
+	grp->cam_ap_num_stas = 0;
 	grp->cam_mirror_active = 0;
 }
 
 /*
  * GTK rekey notification — called from set_key_hdl() when the AP
- * installs a new group key. Re-programs the helper's GTK CAM entry
- * with the new key so HW decrypt continues working for broadcast
- * frames after rekey.
+ * installs a new group key. Re-programs the helper's GTK CAM entry.
  */
 void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
 {
 	struct cooperative_rx_group *grp;
-	struct security_priv *psec;
-	u8 gtk_keyid, algo;
-	u8 *gtk_key;
-	u16 gtk_ctrl;
-	bool is_256;
 	int i;
 
 	grp = READ_ONCE(rtw_coop_rx_group);
@@ -519,26 +686,135 @@ void rtw_coop_rx_notify_gtk_rekey(_adapter *adapter)
 	if (grp->primary != adapter)
 		return;
 
-	psec = &adapter->securitypriv;
-	algo = psec->dot11PrivacyAlgrthm;
-	gtk_keyid = psec->dot118021XGrpKeyid;
-	gtk_key = psec->dot118021XGrpKey[gtk_keyid].skey;
-	is_256 = !!(algo & _SEC_TYPE_256_);
-
-	gtk_ctrl = BIT(15) | BIT(6) | ((algo & 0x07) << 2) | gtk_keyid;
-	if (is_256)
-		gtk_ctrl |= BIT(9);
-
 	for (i = 0; i < grp->num_helpers; i++) {
-		_adapter *helper = grp->helpers[i];
-
-		if (!helper)
+		if (!grp->helpers[i])
 			continue;
-		write_cam(helper, 4, gtk_ctrl,
-			  grp->bound_bssid, gtk_key, is_256);
+		coop_cam_program_gtk(grp, grp->helpers[i]);
 	}
 
-	RTW_INFO("coop_rx: CAM mirror GTK rekeyed (keyid=%d)\n", gtk_keyid);
+	RTW_INFO("coop_rx: CAM mirror GTK rekeyed (keyid=%d)\n",
+		 adapter->securitypriv.dot118021XGrpKeyid);
+}
+
+/*
+ * Per-STA PTK notification — called from set_stakey_hdl() when a
+ * client STA's pairwise key is installed (after 4-way handshake)
+ * or rekeyed. Programs the STA's PTK into helpers' CAM.
+ *
+ * In STA mode, also updates slot 0 for PTK rekey.
+ */
+void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
+{
+	struct cooperative_rx_group *grp;
+	int i;
+	u8 algo;
+
+	grp = READ_ONCE(rtw_coop_rx_group);
+	if (!grp || !grp->cam_mirror_active)
+		return;
+	if (grp->primary != adapter)
+		return;
+
+	algo = psta->dot118021XPrivacy;
+	if (algo == _NO_PRIVACY_)
+		return;
+
+	if (!grp->cam_is_ap) {
+		/* STA mode: update slot 0 for PTK rekey */
+		for (i = 0; i < grp->num_helpers; i++) {
+			if (!grp->helpers[i])
+				continue;
+			coop_cam_program_ptk(grp->helpers[i], 0, algo,
+					     psta->cmn.mac_addr,
+					     psta->dot118021x_UncstKey.skey);
+		}
+		RTW_INFO("coop_rx: CAM mirror PTK rekeyed for "MAC_FMT"\n",
+			 MAC_ARG(psta->cmn.mac_addr));
+	} else {
+		/* AP mode: allocate/reuse slot for this STA */
+		bool is_256 = !!(algo & _SEC_TYPE_256_);
+		int idx = coop_cam_ap_alloc_slot(grp, psta->cmn.mac_addr);
+
+		if (idx < 0) {
+			RTW_WARN("coop_rx: CAM mirror — no slot for "MAC_FMT
+				 " (%d/%d), SW decrypt fallback\n",
+				 MAC_ARG(psta->cmn.mac_addr),
+				 grp->cam_ap_num_stas,
+				 COOP_CAM_AP_MAX_STAS);
+			return;
+		}
+
+		if (!grp->cam_ap_sta_valid[idx]) {
+			/* New slot */
+			memcpy(grp->cam_ap_sta_mac[idx],
+			       psta->cmn.mac_addr, ETH_ALEN);
+			grp->cam_ap_sta_valid[idx] = 1;
+			grp->cam_ap_num_stas++;
+		}
+
+		for (i = 0; i < grp->num_helpers; i++) {
+			if (!grp->helpers[i])
+				continue;
+			coop_cam_program_ptk(grp->helpers[i],
+					     coop_cam_ap_ptk_slot(idx, is_256),
+					     algo, psta->cmn.mac_addr,
+					     psta->dot118021x_UncstKey.skey);
+		}
+
+		RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
+			 " PTK → slot %d (%d/%d)\n",
+			 MAC_ARG(psta->cmn.mac_addr), idx,
+			 grp->cam_ap_num_stas, COOP_CAM_AP_MAX_STAS);
+	}
+}
+
+/*
+ * STA removal notification — called when an AP client disassociates.
+ * Clears that STA's PTK from all helpers' CAM and frees the slot.
+ */
+void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
+{
+	struct cooperative_rx_group *grp;
+	int i, j;
+	bool is_256;
+
+	grp = READ_ONCE(rtw_coop_rx_group);
+	if (!grp || !grp->cam_mirror_active || !grp->cam_is_ap)
+		return;
+	if (grp->primary != adapter)
+		return;
+
+	is_256 = !!(grp->primary->securitypriv.dot11PrivacyAlgrthm &
+		     _SEC_TYPE_256_);
+
+	for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
+		if (!grp->cam_ap_sta_valid[j])
+			continue;
+		if (!_rtw_memcmp(grp->cam_ap_sta_mac[j],
+				 psta->cmn.mac_addr, ETH_ALEN))
+			continue;
+
+		/* Found — clear from all helpers */
+		for (i = 0; i < grp->num_helpers; i++) {
+			if (!grp->helpers[i])
+				continue;
+			clear_cam_entry(grp->helpers[i],
+					coop_cam_ap_ptk_slot(j, is_256));
+			if (is_256)
+				clear_cam_entry(grp->helpers[i],
+						coop_cam_ap_ptk_slot(j, is_256) + 1);
+		}
+
+		grp->cam_ap_sta_valid[j] = 0;
+		memset(grp->cam_ap_sta_mac[j], 0, ETH_ALEN);
+		grp->cam_ap_num_stas--;
+
+		RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
+			 " removed from slot %d (%d/%d)\n",
+			 MAC_ARG(psta->cmn.mac_addr), j,
+			 grp->cam_ap_num_stas, COOP_CAM_AP_MAX_STAS);
+		return;
+	}
 }
 #endif /* CONFIG_COOP_RX_CAM_MIRROR */
 
