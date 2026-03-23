@@ -139,7 +139,6 @@ static int coop_rx_crypto_init(struct cooperative_rx_group *grp)
 					  crypto_aead_reqsize(grp->tfm_gcm));
 
 		if (max_reqsize > 0) {
-			grp->prealloc_reqsize = max_reqsize;
 			grp->prealloc_req = kmalloc(
 				sizeof(struct aead_request) + max_reqsize,
 				GFP_KERNEL);
@@ -162,7 +161,14 @@ static void coop_rx_crypto_deinit(struct cooperative_rx_group *grp)
 {
 	kfree(grp->prealloc_req);
 	grp->prealloc_req = NULL;
-	grp->prealloc_reqsize = 0;
+
+
+	/* Clear cached key so crypto_init re-sets the key on the
+	 * new transforms. Without this, a rebind to the same AP
+	 * would skip setkey (key matches cache) but the fresh
+	 * transform has no key schedule loaded → decrypt fails. */
+	grp->cached_key_len = 0;
+	memset(grp->cached_key, 0, sizeof(grp->cached_key));
 
 	if (grp->tfm_ccm) {
 		crypto_free_aead(grp->tfm_ccm);
@@ -925,8 +931,13 @@ int rtw_coop_rx_bind_session(_adapter *primary)
 	grp->bound_channel = primary->mlmeextpriv.cur_channel;
 	grp->bound_bw = primary->mlmeextpriv.cur_bwmode;
 
-	/* Reset non-QoS dedup cache */
+	/* Reset non-QoS dedup cache under its own lock to prevent
+	 * torn reads from a concurrent submit_helper_frame. Safe to
+	 * nest: grp->lock held with IRQs disabled, nonqos_lock is
+	 * always taken from softirq so plain spin_lock suffices. */
+	spin_lock(&grp->nonqos_lock);
 	memset(&grp->nonqos_cache, 0, sizeof(grp->nonqos_cache));
+	spin_unlock(&grp->nonqos_lock);
 
 	if (grp->num_helpers > 0)
 		grp->state = COOP_STATE_ACTIVE;
@@ -1623,7 +1634,11 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	 * (~50-100 ms latency spike). The newest frame is more likely
 	 * a duplicate that the primary already received.
 	 */
-	if (atomic_read(&grp->pending_count) >= coop_pending_max(grp)) {
+	if (atomic_inc_return(&grp->pending_count) > coop_pending_max(grp)) {
+		/* Over limit — drop the newest frame (the one we just
+		 * counted). The oldest queued frame may be what the
+		 * reorder window is stalling on. */
+		atomic_dec(&grp->pending_count);
 		atomic_inc(&grp->stats.helper_rx_backpressure);
 		rtw_free_recvframe(pframe_primary,
 				   &primary->recvpriv.free_recv_queue);
@@ -1631,7 +1646,6 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		return RTW_RX_HANDLED;
 	}
 	rtw_enqueue_recvframe(pframe_primary, &grp->pending_queue);
-	atomic_inc(&grp->pending_count);
 	atomic_inc(&grp->stats.helper_rx_deferred);
 	tasklet_schedule(&grp->coop_rx_tasklet);
 

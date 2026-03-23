@@ -124,7 +124,6 @@ struct cooperative_rx_group {
 	 * transform's reqsize. Only accessed from drain tasklet
 	 * (serialized), so no locking needed. */
 	struct aead_request *prealloc_req;
-	size_t prealloc_reqsize;	/* allocated __ctx size */
 #endif
 
 #ifdef CONFIG_COOP_RX_CAM_MIRROR
@@ -148,7 +147,7 @@ struct cooperative_rx_group {
 	 * since helpers share the pool transiently.
 	 */
 #define COOP_PENDING_BASE	48	/* per-helper burst budget */
-#define coop_pending_max(grp)	(COOP_PENDING_BASE * (1 + (grp)->num_helpers))
+#define coop_pending_max(grp)	(COOP_PENDING_BASE * (1 + READ_ONCE((grp)->num_helpers)))
 #define COOP_BATCH_SIZE		64	/* frames per tasklet run */
 #define COOP_RCU_BATCH		16	/* re-check RCU every N frames */
 
