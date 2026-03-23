@@ -1248,10 +1248,17 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				_helper_priority = 0;
 
 			/*
-			 * CRITICAL: ALL frames go through recv_func_posthandle.
-			 * For open networks, encrypt==0 so this simply does
-			 * defrag -> reorder -> indicate. Never bypass this
-			 * with direct recv_indicatepkt_reorder calls.
+			 * Route through recv_func_posthandle for proper
+			 * 802.11→ethernet conversion and reorder window
+			 * management. recv_decache inside will claim the
+			 * seq_ctrl, which means the primary's later copy
+			 * gets dropped. This is the correct behavior —
+			 * first arrival wins at the driver level.
+			 *
+			 * The rx_dropped counter may increase if both copies
+			 * reach the network stack before dedup, but the
+			 * reorder window prevents double-delivery for QoS
+			 * traffic. For non-QoS, recv_decache handles it.
 			 */
 			ret = recv_func_posthandle(primary, pframe);
 

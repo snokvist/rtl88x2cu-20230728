@@ -167,6 +167,8 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 
 /* Declared in rtw_recv.c — needed by drain tasklet */
 int recv_func_posthandle(_adapter *padapter, union recv_frame *prframe);
+int recv_indicatepkt_reorder(_adapter *padapter, union recv_frame *prframe);
+int recv_process_mpdu(_adapter *padapter, union recv_frame *prframe);
 
 /* Query helpers — these are called from hot paths so must be fast */
 static inline bool rtw_coop_rx_enabled(void)
