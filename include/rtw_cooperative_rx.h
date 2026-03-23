@@ -153,6 +153,7 @@ struct cooperative_rx_group {
 #define COOP_CAM_AP_MAX_STAS	8
 	u8 cam_ap_sta_valid[COOP_CAM_AP_MAX_STAS];
 	u8 cam_ap_sta_mac[COOP_CAM_AP_MAX_STAS][ETH_ALEN];
+	u8 cam_ap_sta_is256[COOP_CAM_AP_MAX_STAS]; /* per-STA key width */
 	u8 cam_ap_num_stas;
 #endif
 

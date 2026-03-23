@@ -553,8 +553,19 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 
 	grp->cam_mirror_active = 1;
 
-	/* AP mode: pick up PTKs for any already-associated STAs */
+	/* AP mode: pick up PTKs for any already-associated STAs.
+	 *
+	 * IMPORTANT: Collect STA info under sta_hash_lock, then release
+	 * the spinlock before calling write_cam(). write_cam() acquires
+	 * a mutex (sec_cam_access_mutex) internally, which can sleep —
+	 * sleeping while holding a spinlock is illegal. */
 	if (is_ap) {
+		struct {
+			u8 mac[ETH_ALEN];
+			u8 key[32];
+			u8 algo;
+		} snap_stas[COOP_CAM_AP_MAX_STAS];
+		int snap_count = 0;
 		_irqL irqL;
 		struct sta_priv *pstapriv = &primary->stapriv;
 		struct sta_info *psta;
@@ -564,8 +575,9 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 		struct sta_info *bmc_sta = rtw_get_bcmc_stainfo(primary);
 		int j;
 
+		/* Phase 1: snapshot STA info under lock */
 		_enter_critical_bh(&pstapriv->sta_hash_lock, &irqL);
-		for (j = 0; j < NUM_STA; j++) {
+		for (j = 0; j < NUM_STA && snap_count < COOP_CAM_AP_MAX_STAS; j++) {
 			phead = &pstapriv->sta_hash[j];
 			plist = get_next(phead);
 			while (!rtw_end_of_queue_search(phead, plist)) {
@@ -573,51 +585,56 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 						      hash_list);
 				plist = get_next(plist);
 
-				/* Skip AP-self and broadcast pseudo-STAs */
 				if (!psta || psta == ap_self || psta == bmc_sta)
 					continue;
-
-				/* Only add if key is installed */
 				if (psta->dot118021XPrivacy == _NO_PRIVACY_)
 					continue;
+				if (snap_count >= COOP_CAM_AP_MAX_STAS)
+					break;
 
-				/* Allocate CAM slot */
-				{
-					int idx = coop_cam_ap_alloc_slot(grp,
-							psta->cmn.mac_addr);
-					if (idx < 0) {
-						RTW_WARN("coop_rx: CAM mirror — "
-							 "no slot for "MAC_FMT
-							 "\n", MAC_ARG(
-							 psta->cmn.mac_addr));
-						continue;
-					}
-
-					memcpy(grp->cam_ap_sta_mac[idx],
-					       psta->cmn.mac_addr, ETH_ALEN);
-					grp->cam_ap_sta_valid[idx] = 1;
-					grp->cam_ap_num_stas++;
-
-					for (i = 0; i < num_helpers; i++) {
-						if (!helpers[i])
-							continue;
-						coop_cam_program_ptk(helpers[i],
-							coop_cam_ap_ptk_slot(idx,
-								!!(algo & _SEC_TYPE_256_)),
-							psta->dot118021XPrivacy,
-							psta->cmn.mac_addr,
-							psta->dot118021x_UncstKey.skey);
-					}
-
-					RTW_INFO("coop_rx: CAM mirror AP — "
-						 "existing STA "MAC_FMT
-						 " → slot %d\n",
-						 MAC_ARG(psta->cmn.mac_addr),
-						 idx);
-				}
+				memcpy(snap_stas[snap_count].mac,
+				       psta->cmn.mac_addr, ETH_ALEN);
+				memcpy(snap_stas[snap_count].key,
+				       psta->dot118021x_UncstKey.skey, 32);
+				snap_stas[snap_count].algo =
+					psta->dot118021XPrivacy;
+				snap_count++;
 			}
 		}
 		_exit_critical_bh(&pstapriv->sta_hash_lock, &irqL);
+
+		/* Phase 2: program CAM outside the lock (write_cam sleeps) */
+		for (j = 0; j < snap_count; j++) {
+			bool sta_256 = !!(snap_stas[j].algo & _SEC_TYPE_256_);
+			int idx = coop_cam_ap_alloc_slot(grp,
+							 snap_stas[j].mac);
+			if (idx < 0) {
+				RTW_WARN("coop_rx: CAM mirror — no slot for "
+					 MAC_FMT"\n",
+					 MAC_ARG(snap_stas[j].mac));
+				continue;
+			}
+
+			memcpy(grp->cam_ap_sta_mac[idx],
+			       snap_stas[j].mac, ETH_ALEN);
+			grp->cam_ap_sta_valid[idx] = 1;
+			grp->cam_ap_sta_is256[idx] = sta_256;
+			grp->cam_ap_num_stas++;
+
+			for (i = 0; i < num_helpers; i++) {
+				if (!helpers[i])
+					continue;
+				coop_cam_program_ptk(helpers[i],
+					coop_cam_ap_ptk_slot(idx, sta_256),
+					snap_stas[j].algo,
+					snap_stas[j].mac,
+					snap_stas[j].key);
+			}
+
+			RTW_INFO("coop_rx: CAM mirror AP — existing STA "
+				 MAC_FMT" → slot %d (is_256=%d)\n",
+				 MAC_ARG(snap_stas[j].mac), idx, sta_256);
+		}
 	}
 
 	RTW_INFO("coop_rx: CAM mirror installed (algo=%d, is_ap=%d, "
@@ -627,13 +644,9 @@ static void coop_rx_cam_mirror_install(struct cooperative_rx_group *grp,
 static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 {
 	int i, j;
-	bool is_256;
 
 	if (!grp->cam_mirror_active)
 		return;
-
-	is_256 = !!(grp->primary->securitypriv.dot11PrivacyAlgrthm &
-		     _SEC_TYPE_256_);
 
 	for (i = 0; i < grp->num_helpers; i++) {
 		_adapter *helper = grp->helpers[i];
@@ -646,15 +659,19 @@ static void coop_rx_cam_mirror_clear(struct cooperative_rx_group *grp)
 			clear_cam_entry(helper, 0);
 			clear_cam_entry(helper, 1);
 		} else {
-			/* AP mode: clear all per-STA PTK slots */
+			/* AP mode: clear all per-STA PTK slots using
+			 * the per-STA is_256 that was recorded at install */
 			for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
+				bool s256;
+				u8 slot;
+
 				if (!grp->cam_ap_sta_valid[j])
 					continue;
-				clear_cam_entry(helper,
-					coop_cam_ap_ptk_slot(j, is_256));
-				if (is_256)
-					clear_cam_entry(helper,
-						coop_cam_ap_ptk_slot(j, is_256) + 1);
+				s256 = grp->cam_ap_sta_is256[j];
+				slot = coop_cam_ap_ptk_slot(j, s256);
+				clear_cam_entry(helper, slot);
+				if (s256)
+					clear_cam_entry(helper, slot + 1);
 			}
 		}
 
@@ -744,13 +761,35 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 			return;
 		}
 
-		if (!grp->cam_ap_sta_valid[idx]) {
+		if (grp->cam_ap_sta_valid[idx]) {
+			/* Existing slot — rekey. If key width changed
+			 * (128↔256), clear old entry at old stride first
+			 * to avoid stale CAM slots. */
+			bool old_256 = grp->cam_ap_sta_is256[idx];
+
+			if (old_256 != is_256) {
+				u8 old_slot = coop_cam_ap_ptk_slot(idx,
+								   old_256);
+				for (i = 0; i < grp->num_helpers; i++) {
+					if (!grp->helpers[i])
+						continue;
+					clear_cam_entry(grp->helpers[i],
+							old_slot);
+					if (old_256)
+						clear_cam_entry(
+							grp->helpers[i],
+							old_slot + 1);
+				}
+			}
+		} else {
 			/* New slot */
 			memcpy(grp->cam_ap_sta_mac[idx],
 			       psta->cmn.mac_addr, ETH_ALEN);
 			grp->cam_ap_sta_valid[idx] = 1;
 			grp->cam_ap_num_stas++;
 		}
+
+		grp->cam_ap_sta_is256[idx] = is_256;
 
 		for (i = 0; i < grp->num_helpers; i++) {
 			if (!grp->helpers[i])
@@ -762,8 +801,8 @@ void rtw_coop_rx_notify_sta_key(_adapter *adapter, struct sta_info *psta)
 		}
 
 		RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
-			 " PTK → slot %d (%d/%d)\n",
-			 MAC_ARG(psta->cmn.mac_addr), idx,
+			 " PTK → slot %d is_256=%d (%d/%d)\n",
+			 MAC_ARG(psta->cmn.mac_addr), idx, is_256,
 			 grp->cam_ap_num_stas, COOP_CAM_AP_MAX_STAS);
 	}
 }
@@ -776,7 +815,6 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 {
 	struct cooperative_rx_group *grp;
 	int i, j;
-	bool is_256;
 
 	grp = READ_ONCE(rtw_coop_rx_group);
 	if (!grp || !grp->cam_mirror_active || !grp->cam_is_ap)
@@ -784,29 +822,31 @@ void rtw_coop_rx_notify_sta_del(_adapter *adapter, struct sta_info *psta)
 	if (grp->primary != adapter)
 		return;
 
-	is_256 = !!(grp->primary->securitypriv.dot11PrivacyAlgrthm &
-		     _SEC_TYPE_256_);
-
 	for (j = 0; j < COOP_CAM_AP_MAX_STAS; j++) {
+		bool s256;
+		u8 slot;
+
 		if (!grp->cam_ap_sta_valid[j])
 			continue;
 		if (!_rtw_memcmp(grp->cam_ap_sta_mac[j],
 				 psta->cmn.mac_addr, ETH_ALEN))
 			continue;
 
-		/* Found — clear from all helpers */
+		/* Found — use per-STA is_256 recorded at install time */
+		s256 = grp->cam_ap_sta_is256[j];
+		slot = coop_cam_ap_ptk_slot(j, s256);
+
 		for (i = 0; i < grp->num_helpers; i++) {
 			if (!grp->helpers[i])
 				continue;
-			clear_cam_entry(grp->helpers[i],
-					coop_cam_ap_ptk_slot(j, is_256));
-			if (is_256)
-				clear_cam_entry(grp->helpers[i],
-						coop_cam_ap_ptk_slot(j, is_256) + 1);
+			clear_cam_entry(grp->helpers[i], slot);
+			if (s256)
+				clear_cam_entry(grp->helpers[i], slot + 1);
 		}
 
 		grp->cam_ap_sta_valid[j] = 0;
 		memset(grp->cam_ap_sta_mac[j], 0, ETH_ALEN);
+		grp->cam_ap_sta_is256[j] = 0;
 		grp->cam_ap_num_stas--;
 
 		RTW_INFO("coop_rx: CAM mirror AP — STA "MAC_FMT
