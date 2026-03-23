@@ -2373,14 +2373,11 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 #ifdef CONFIG_COOP_RX_KERNEL_CRYPTO
 		coop_post_decrypt:
 #endif
-			if (pa->qos) {
-				if (psta)
-					pframe->u.hdr.preorder_ctrl =
-						&psta->recvreorder_ctrl[_helper_priority];
-				ret = recv_indicatepkt_reorder(primary, pframe);
-			} else {
-				ret = recv_process_mpdu(primary, pframe);
-			}
+			/* All frames go through recv_func_posthandle for
+			 * proper decrypt/strip/defrag/reorder pipeline.
+			 * For bdecrypted=1 (CAM/kernel crypto): strips IV/MIC
+			 * For !encrypt: passthrough to reorder */
+			ret = recv_func_posthandle(primary, pframe);
 		}
 
 		/*
