@@ -16,6 +16,7 @@
 
 #include <drv_types.h>
 #include <hal_data.h>
+#include <rtw_cooperative_rx.h>
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0))
 #define strlcpy strscpy
@@ -116,6 +117,16 @@ int rtw_nb_config = CONFIG_NB_VALUE;
 module_param(rtw_nb_config, int, 0644);
 MODULE_PARM_DESC(rtw_nb_config, "5M/10M/Normal bandwidth configuration");
 #endif
+
+/* Cooperative RX diversity: 0=disabled (default), 1=enabled */
+extern int rtw_cooperative_rx;
+module_param(rtw_cooperative_rx, int, 0444);
+MODULE_PARM_DESC(rtw_cooperative_rx, "Enable cooperative RX diversity (0=off, 1=on)");
+
+extern int rtw_coop_rx_drop_primary;
+module_param(rtw_coop_rx_drop_primary, int, 0600);
+MODULE_PARM_DESC(rtw_coop_rx_drop_primary,
+	"Debug: drop primary RX data frames when cooperative RX active (0=off, 1=on)");
 
 module_param(rtw_ips_mode, int, 0644);
 MODULE_PARM_DESC(rtw_ips_mode, "The default IPS mode");
@@ -1817,7 +1828,7 @@ static int rtw_siocdevprivate(struct net_device *dev, struct ifreq *ifr,
 #endif
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
-static const struct net_device_ops rtw_netdev_ops = {
+const struct net_device_ops rtw_netdev_ops = {
 	.ndo_init = rtw_ndev_init,
 	.ndo_uninit = rtw_ndev_uninit,
 	.ndo_open = netdev_open,
@@ -2154,9 +2165,10 @@ int rtw_os_ndev_register(_adapter *adapter, const char *name)
 	else
 		ret = (register_netdevice(ndev) == 0) ? _SUCCESS : _FAIL;
 
-	if (ret == _SUCCESS)
+	if (ret == _SUCCESS) {
 		adapter->registered = 1;
-	else
+		rtw_coop_rx_sysfs_init(ndev);
+	} else
 		RTW_INFO(FUNC_NDEV_FMT" if%d Failed!\n", FUNC_NDEV_ARG(ndev), (adapter->iface_id + 1));
 
 #if defined(CONFIG_IOCTL_CFG80211)
@@ -2193,6 +2205,9 @@ void rtw_os_ndev_unregister(_adapter *adapter)
 #if defined(CONFIG_IOCTL_CFG80211)
 	rtw_cfg80211_ndev_res_unregister(adapter);
 #endif
+
+	if (netdev)
+		rtw_coop_rx_sysfs_deinit(netdev);
 
 	if ((adapter->DriverState != DRIVER_DISAPPEAR) && netdev) {
 		struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);

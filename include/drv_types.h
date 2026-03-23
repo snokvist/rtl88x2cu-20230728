@@ -2086,6 +2086,8 @@ struct _ADAPTER {
 #ifdef RTW_SIMPLE_CONFIG
 	u8 rtw_simple_config;
 #endif
+
+	u8 is_coop_helper;	/* cached cooperative RX helper flag */
 };
 
 #define adapter_to_dvobj(adapter) ((adapter)->dvobj)
