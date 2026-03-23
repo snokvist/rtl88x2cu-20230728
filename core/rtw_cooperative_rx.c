@@ -1003,10 +1003,11 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 	pframe_primary->u.hdr.pkt = precvframe->u.hdr.pkt;
 	precvframe->u.hdr.pkt = NULL;  /* prevent double-free */
 
-	/* Copy frame metadata */
+	/* Copy frame metadata and mark as helper-injected */
 	_rtw_memcpy(&pframe_primary->u.hdr.attrib,
 		     &precvframe->u.hdr.attrib,
 		     sizeof(struct rx_pkt_attrib));
+	pframe_primary->u.hdr.attrib.coop_helper = 1;
 	pframe_primary->u.hdr.len = precvframe->u.hdr.len;
 
 	/*
@@ -1075,9 +1076,11 @@ int rtw_coop_rx_submit_helper_frame(union recv_frame *precvframe,
 		return RTW_RX_HANDLED;
 	}
 	atomic_inc(&grp->stats.helper_rx_deferred);
-	/* Use tasklet_hi_schedule for higher priority than normal tasklets,
-	 * reducing scheduling latency vs standard tasklet_schedule. */
-	tasklet_hi_schedule(&grp->coop_rx_tasklet);
+	/* Use standard tasklet_schedule (not hi_schedule) so the primary's
+	 * USB recv tasklet runs first. This gives the primary time to
+	 * process its copy and claim *prxseq before the helper's drain
+	 * tasklet runs, preventing the helper from starving the primary. */
+	tasklet_schedule(&grp->coop_rx_tasklet);
 
 	rcu_read_unlock();
 	return RTW_RX_HANDLED;
@@ -1192,11 +1195,12 @@ static void _coop_rx_drain_tasklet(struct cooperative_rx_group *grp)
 				continue;
 			}
 
-			/* Do NOT write *prxseq here. Let recv_func_posthandle's
-			 * internal recv_decache handle the claim. Writing here
-			 * causes the primary's recv_decache to drop ALL its
-			 * frames (including ping replies) since the helper's
-			 * tasklet consistently wins the race. */
+			/* Claim this seq so primary's recv_decache drops its
+			 * copy. With standard tasklet_schedule (not hi), the
+			 * primary's USB recv tasklet runs first for frames it
+			 * received, so it claims prxseq first. The helper
+			 * only wins for frames the primary missed. */
+			WRITE_ONCE(*prxseq, seq_ctrl);
 		}
 
 		/*

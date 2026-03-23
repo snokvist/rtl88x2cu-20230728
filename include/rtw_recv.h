@@ -194,6 +194,7 @@ struct rx_pkt_attrib	{
 	u8	ldpc;
 	u8	sgi;
 	u8	pkt_rpt_type;
+	u8	coop_helper;	/* frame injected by cooperative RX helper */
 	u32	MacIDValidEntry[2];	/* 64 bits present 64 entry. */
 	u8	ampdu;
 	u8	ppdu_cnt;
